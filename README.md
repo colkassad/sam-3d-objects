@@ -52,7 +52,7 @@ from inference import Inference, load_image, load_single_mask
 # load model
 tag = "hf"
 config_path = f"checkpoints/{tag}/pipeline.yaml"
-inference = Inference(config_path, compile=False)
+inference = Inference(config_path, compile=False, memory_profile="auto")
 
 # load image and mask
 image = load_image("notebook/images/shutterstock_stylish_kidsroom_1640806567/image.png")
@@ -61,9 +61,70 @@ mask = load_single_mask("notebook/images/shutterstock_stylish_kidsroom_164080656
 # run model
 output = inference(image, mask, seed=42)
 
-# export gaussian splat
-output["gs"].save_ply(f"splat.ply")
+# export vertex-colored mesh
+output["glb"].export("mesh.glb")
 ```
+
+For recognizable, low-detail route features such as parked cars, trees, and
+signs, request a triangle budget and fewer diffusion steps:
+
+```python
+output = inference(
+    image,
+    mask,
+    seed=42,
+    mesh_target_faces=10_000,
+    flat_shading=True,
+    stage1_inference_steps=15,
+    stage2_inference_steps=15,
+)
+output["glb"].export("mesh_low_poly.glb")
+```
+
+`mesh_target_faces` uses CPU quadric decimation while preserving vertex colors;
+it does not reduce generation time. Reducing the sampling steps speeds up the
+two diffusion stages with a corresponding quality tradeoff. Defaults remain at
+the checkpoint's full sampling settings when these arguments are omitted.
+
+Benchmark this route-feature profile with:
+
+```bash
+python scripts/profile_inference.py --memory-profile low_vram \
+  --mesh-target-faces 10000 --flat-shading \
+  --stage1-inference-steps 15 --stage2-inference-steps 15
+```
+
+`memory_profile="auto"` uses staged CPU/GPU model residency on GPUs with up to
+17 GiB of VRAM. Models remain cached in CPU RAM between requests, while only the
+active inference stage is moved to CUDA. The default output is a vertex-colored
+mesh. At least 24 GiB of system RAM is recommended. Request Gaussian output
+explicitly when needed:
+
+```python
+inference = Inference(
+    config_path,
+    memory_profile="auto",
+    output_formats=("gaussian",),
+)
+output = inference(image, mask, seed=42)
+output["gs"].save_ply("splat.ply")
+```
+
+Use `memory_profile="resident"` to retain the original all-models-on-GPU
+scheduling on larger accelerators. Pass `profile_memory=True` and call
+`inference.get_memory_report()` for per-stage timing and peak
+allocated/reserved CUDA memory measurements.
+
+To run the included 14.5 GiB peak-memory check and five warm iterations:
+
+```bash
+python scripts/profile_inference.py --memory-profile low_vram
+```
+
+The profiler also reports activation-transfer, compute, offload, and allocator
+cache-clear time per stage. When NVML is available, it samples GPU clocks,
+temperature, power, utilization, host available memory, and swap activity to
+help diagnose warm-run slowdowns.
 
 For  more details and multi-object reconstruction, please take a look at out two jupyter notebooks:
 * [single object](notebook/demo_single_object.ipynb)

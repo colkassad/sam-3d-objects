@@ -54,6 +54,14 @@ class FlexiCubes:
         ], dtype=torch.long, device=device)
         self.adj_pairs = torch.tensor([0, 1, 1, 3, 3, 2, 2, 0], dtype=torch.long, device=device)
 
+    def to(self, device):
+        """Move lookup tables that are not registered module buffers."""
+        self.device = device
+        for name, value in vars(self).items():
+            if torch.is_tensor(value):
+                setattr(self, name, value.to(device))
+        return self
+
     def __call__(self, voxelgrid_vertices, scalar_field, cube_idx, resolution, qef_reg_scale=1e-3,
                  weight_scale=0.99, beta=None, alpha=None, gamma_f=None, voxelgrid_colors=None, training=False):
         assert torch.is_tensor(voxelgrid_vertices) and \

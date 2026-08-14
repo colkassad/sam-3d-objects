@@ -6,7 +6,7 @@ os.environ["CUDA_HOME"] = os.environ["CONDA_PREFIX"]
 os.environ["LIDRA_SKIP_INIT"] = "true"
 
 import sys
-from typing import Union, Optional, List, Callable
+from typing import Union, Optional, List, Callable, Literal, Sequence
 import numpy as np
 from PIL import Image
 from omegaconf import OmegaConf, DictConfig, ListConfig
@@ -29,6 +29,12 @@ from pytorch3d.transforms import quaternion_multiply, quaternion_invert
 
 import sam3d_objects  # REMARK(Pierre) : do not remove this import
 from sam3d_objects.pipeline.inference_pipeline_pointmap import InferencePipelinePointMap
+from sam3d_objects.pipeline.inference_pipeline import (
+    normalize_inference_steps,
+    normalize_mesh_target_faces,
+    normalize_output_formats,
+    resolve_memory_profile,
+)
 from sam3d_objects.model.backbone.tdfy_dit.utils import render_utils
 
 from sam3d_objects.utils.visualization import SceneVisualizer
@@ -36,7 +42,8 @@ from sam3d_objects.utils.visualization import SceneVisualizer
 __all__ = ["Inference"]
 
 WHITELIST_FILTERS = [
-    lambda target: target.split(".", 1)[0] in {"sam3d_objects", "torch", "torchvision", "moge"},
+    lambda target: target.split(".", 1)[0]
+    in {"sam3d_objects", "torch", "torchvision", "moge"},
 ]
 
 BLACKLIST_FILTERS = [
@@ -82,14 +89,31 @@ BLACKLIST_FILTERS = [
 class Inference:
     # public facing inference API
     # only put publicly exposed arguments here
-    def __init__(self, config_file: str, compile: bool = False):
+    def __init__(
+        self,
+        config_file: str,
+        compile: bool = False,
+        memory_profile: Literal["auto", "low_vram", "resident"] = "auto",
+        output_formats: Sequence[Literal["mesh", "gaussian", "gaussian_4"]] = ("mesh",),
+        profile_memory: bool = False,
+    ):
         # load inference pipeline
         config = OmegaConf.load(config_file)
+        output_formats = normalize_output_formats(output_formats)
+        resolved_memory_profile = resolve_memory_profile(memory_profile, "cuda")
         config.rendering_engine = "pytorch3d"  # overwrite to disable nvdiffrast
         config.compile_model = compile
+        config.memory_profile = memory_profile
+        config.decode_formats = list(output_formats)
+        config.profile_memory = profile_memory
+        if resolved_memory_profile == "low_vram":
+            config.depth_model.device = "cpu"
         config.workspace_dir = os.path.dirname(config_file)
         check_hydra_safety(config, WHITELIST_FILTERS, BLACKLIST_FILTERS)
         self._pipeline: InferencePipelinePointMap = instantiate(config)
+
+    def get_memory_report(self):
+        return self._pipeline.get_memory_report()
 
     def merge_mask_to_rgba(self, image, mask):
         mask = mask.astype(np.uint8) * 255
@@ -104,8 +128,24 @@ class Inference:
         mask: Optional[Union[None, Image.Image, np.ndarray]],
         seed: Optional[int] = None,
         pointmap=None,
+        output_formats: Optional[
+            Sequence[Literal["mesh", "gaussian", "gaussian_4"]]
+        ] = None,
+        mesh_target_faces: Optional[int] = None,
+        flat_shading: bool = False,
+        stage1_inference_steps: Optional[int] = None,
+        stage2_inference_steps: Optional[int] = None,
     ) -> dict:
         image = self.merge_mask_to_rgba(image, mask)
+        if output_formats is not None:
+            output_formats = normalize_output_formats(output_formats)
+        mesh_target_faces = normalize_mesh_target_faces(mesh_target_faces)
+        stage1_inference_steps = normalize_inference_steps(
+            stage1_inference_steps, "stage1_inference_steps"
+        )
+        stage2_inference_steps = normalize_inference_steps(
+            stage2_inference_steps, "stage2_inference_steps"
+        )
         return self._pipeline.run(
             image,
             None,
@@ -115,8 +155,12 @@ class Inference:
             with_texture_baking=False,
             with_layout_postprocess=False,
             use_vertex_color=True,
-            stage1_inference_steps=None,
+            stage1_inference_steps=stage1_inference_steps,
+            stage2_inference_steps=stage2_inference_steps,
             pointmap=pointmap,
+            decode_formats=output_formats,
+            mesh_target_faces=mesh_target_faces,
+            flat_shading=flat_shading,
         )
 
 

@@ -31,30 +31,40 @@ def masked_sdpa(q, k, v, q_seqlen, kv_seqlen):
     """
     Mimic xFormers' memory_efficient_attention using PyTorch 2.0 scaled_dot_product_attention.
     """
-    # Build the block-diagonal additive mask
-    # shape: [sum_q_len, sum_kv_len] with 0 where allowed, -inf where masked
-    attn_mask_2d = block_diag_attn_mask(
-        q_seqlen, kv_seqlen, device=q.device, dtype=q.dtype
-    )
+    if len(q_seqlen) != len(kv_seqlen):
+        raise ValueError("q_seqlen and kv_seqlen must have the same batch length")
 
-    # PyTorch’s scaled_dot_product_attention expects a mask broadcastable to
-    # [batch_size, n_heads, q_len, kv_len]. For a single batch, single head:
-    attn_mask_4d = attn_mask_2d.unsqueeze(0).unsqueeze(0)
-    q = q.permute(0, 2, 1, 3)  # [N, H, L, C]
-    k = k.permute(0, 2, 1, 3)  # [N, H, L, C]
-    v = v.permute(0, 2, 1, 3)  # [N, H, L, C]
+    # The public inference path has batch size one. Passing no mask allows
+    # PyTorch to select FlashAttention or another fused SDPA implementation.
+    if len(q_seqlen) == 1:
+        out = F.scaled_dot_product_attention(
+            q.permute(0, 2, 1, 3),
+            k.permute(0, 2, 1, 3),
+            v.permute(0, 2, 1, 3),
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        return out.permute(0, 2, 1, 3)[0]
 
-    # Now call PyTorch 2.0’s built-in SDPA
-    # By default, it will automatically apply the "1/sqrt(dim)" scaling internally.
-    out = F.scaled_dot_product_attention(
-        query=q,
-        key=k,
-        value=v,
-        attn_mask=attn_mask_4d,  # Additive mask
-        dropout_p=0.0,  # or whatever dropout you need
-        is_causal=False,  # True if you want a causal (triangular) mask
-    )
-    # out is shape [1, sum_q_len, dim]
-    out = out.permute(0, 2, 1, 3)
+    # A dense block-diagonal mask scales with sum(q_len) * sum(kv_len).
+    # Execute independent sequences instead, keeping peak attention storage
+    # proportional to the largest sequence pair.
+    outputs = []
+    q_offset = 0
+    kv_offset = 0
+    for q_len, kv_len in zip(q_seqlen, kv_seqlen):
+        q_i = q[:, q_offset : q_offset + q_len].permute(0, 2, 1, 3)
+        k_i = k[:, kv_offset : kv_offset + kv_len].permute(0, 2, 1, 3)
+        v_i = v[:, kv_offset : kv_offset + kv_len].permute(0, 2, 1, 3)
+        out_i = F.scaled_dot_product_attention(
+            q_i,
+            k_i,
+            v_i,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        outputs.append(out_i.permute(0, 2, 1, 3))
+        q_offset += q_len
+        kv_offset += kv_len
 
-    return out[0]
+    return torch.cat(outputs, dim=1)[0]

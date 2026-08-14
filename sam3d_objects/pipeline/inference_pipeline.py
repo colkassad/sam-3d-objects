@@ -1,5 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 import os
+import time
+from contextlib import contextmanager
+from numbers import Integral
+from typing import Iterable, List, Literal, Sequence, Union
 
 from tqdm import tqdm
 import torch
@@ -15,14 +19,14 @@ def set_attention_backend():
         gpu_name = "CPU"
 
     logger.info(f"GPU name is {gpu_name}")
-    if "A100" in gpu_name or "H100" in gpu_name or "H200" in gpu_name:
-        # logger.info("Use flash_attn")
-        os.environ["ATTN_BACKEND"] = "flash_attn"
-        os.environ["SPARSE_ATTN_BACKEND"] = "flash_attn"
+    logger.info(
+        "Attention backend: {} (PyTorch SDPA performs capability-based CUDA dispatch)",
+        os.environ.get("ATTN_BACKEND", "sdpa"),
+    )
+
 
 set_attention_backend()
 
-from typing import List, Union
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 import numpy as np
@@ -47,7 +51,244 @@ from sam3d_objects.model.io import (
 
 from sam3d_objects.model.backbone.tdfy_dit.modules import sparse as sp
 from sam3d_objects.model.backbone.tdfy_dit.utils import postprocessing_utils
+from sam3d_objects.model.backbone.dit.embedder.dino import Dino
 from safetensors.torch import load_file
+
+
+MemoryProfile = Literal["auto", "low_vram", "resident"]
+OutputFormat = Literal["mesh", "gaussian", "gaussian_4"]
+SUPPORTED_OUTPUT_FORMATS = frozenset({"mesh", "gaussian", "gaussian_4"})
+LOW_VRAM_MAX_BYTES = 17 * 1024**3
+CACHE_CLEAR_MIN_RECLAIMABLE_BYTES = 2 * 1024**3
+CACHE_CLEAR_MIN_INACTIVE_SPLIT_BYTES = 512 * 1024**2
+
+
+def resolve_memory_profile(
+    memory_profile: MemoryProfile,
+    device: Union[str, torch.device] = "cuda",
+) -> Literal["low_vram", "resident"]:
+    """Resolve ``auto`` without allocating CUDA memory."""
+    if memory_profile not in {"auto", "low_vram", "resident"}:
+        raise ValueError(
+            f"Unknown memory profile {memory_profile!r}; expected auto, low_vram, or resident"
+        )
+    if memory_profile != "auto":
+        return memory_profile
+
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return "resident"
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    total_memory = torch.cuda.get_device_properties(device_index).total_memory
+    return "low_vram" if total_memory <= LOW_VRAM_MAX_BYTES else "resident"
+
+
+def normalize_output_formats(formats: Sequence[str]) -> tuple[OutputFormat, ...]:
+    formats = tuple(dict.fromkeys(formats))
+    unknown = set(formats) - SUPPORTED_OUTPUT_FORMATS
+    if unknown:
+        raise ValueError(
+            f"Unsupported output formats {sorted(unknown)}; expected values from "
+            f"{sorted(SUPPORTED_OUTPUT_FORMATS)}"
+        )
+    if not formats:
+        raise ValueError("At least one output format is required")
+    return formats
+
+
+def normalize_mesh_target_faces(target_faces):
+    if target_faces is None:
+        return None
+    if isinstance(target_faces, bool) or not isinstance(target_faces, Integral):
+        raise TypeError("mesh_target_faces must be an integer or None")
+    if target_faces <= 0:
+        raise ValueError("mesh_target_faces must be greater than zero")
+    return int(target_faces)
+
+
+def normalize_inference_steps(inference_steps, name):
+    if inference_steps is None:
+        return None
+    if isinstance(inference_steps, bool) or not isinstance(inference_steps, Integral):
+        raise TypeError(f"{name} must be an integer or None")
+    if inference_steps <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return int(inference_steps)
+
+
+def resolve_compile_model(
+    compile_model: bool, memory_profile: Literal["low_vram", "resident"]
+) -> bool:
+    if memory_profile == "low_vram" and compile_model:
+        logger.warning(
+            "torch.compile is disabled in low_vram mode because compiled CUDA graphs "
+            "can retain stage allocations"
+        )
+        return False
+    return compile_model
+
+
+class StageResidencyManager:
+    """Moves complete inference stages between CPU and the execution device."""
+
+    def __init__(
+        self, device: torch.device, enabled: bool, profile_memory: bool = True
+    ):
+        self.device = torch.device(device)
+        self.enabled = enabled and self.device.type == "cuda"
+        self.profile_memory = profile_memory and self.device.type == "cuda"
+        self.measurements = []
+
+    @staticmethod
+    def _move(module, device):
+        if module is None:
+            return
+        if hasattr(module, "to"):
+            module.to(device)
+        elif hasattr(module, "model") and hasattr(module.model, "to"):
+            module.model.to(device)
+            if hasattr(module, "device"):
+                module.device = torch.device(device)
+        else:
+            raise TypeError(f"Cannot move stage object of type {type(module)!r}")
+
+    @staticmethod
+    def _cache_clear_reason(allocated, reserved, inactive_split):
+        reclaimable = max(0, reserved - allocated)
+        if (
+            inactive_split > CACHE_CLEAR_MIN_INACTIVE_SPLIT_BYTES
+            and inactive_split > reserved // 4
+        ):
+            return "fragmented"
+        if (
+            reclaimable > CACHE_CLEAR_MIN_RECLAIMABLE_BYTES
+            and reclaimable > reserved // 2
+        ):
+            return "large_unused_pool"
+        return None
+
+    @contextmanager
+    def activate(self, name: str, modules: Iterable[object]):
+        modules = tuple(module for module in modules if module is not None)
+        total_started = time.perf_counter()
+        if self.profile_memory:
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
+        moved_modules = []
+        activation_started = time.perf_counter()
+        activation_seconds = 0.0
+        compute_started = None
+        try:
+            if self.enabled:
+                for module in modules:
+                    moved_modules.append(module)
+                    self._move(module, self.device)
+            if self.profile_memory:
+                torch.cuda.synchronize(self.device)
+            activation_seconds = time.perf_counter() - activation_started
+            compute_started = time.perf_counter()
+            yield
+        finally:
+            measurement = None
+            try:
+                if self.profile_memory:
+                    torch.cuda.synchronize(self.device)
+                    if compute_started is None:
+                        activation_seconds = time.perf_counter() - activation_started
+                    compute_ended = time.perf_counter()
+                    compute_seconds = (
+                        compute_ended - compute_started
+                        if compute_started is not None
+                        else 0.0
+                    )
+                    measurement = {
+                        "stage": name,
+                        "started_monotonic_seconds": total_started,
+                        "compute_started_monotonic_seconds": compute_started,
+                        "compute_ended_monotonic_seconds": compute_ended,
+                        # Kept for compatibility with earlier profiler output.
+                        "elapsed_seconds": activation_seconds + compute_seconds,
+                        "activation_seconds": activation_seconds,
+                        "compute_seconds": compute_seconds,
+                        "peak_allocated_bytes": torch.cuda.max_memory_allocated(
+                            self.device
+                        ),
+                        "peak_reserved_bytes": torch.cuda.max_memory_reserved(
+                            self.device
+                        ),
+                        "allocated_bytes": torch.cuda.memory_allocated(self.device),
+                        "reserved_bytes": torch.cuda.memory_reserved(self.device),
+                    }
+            finally:
+                offload_started = time.perf_counter()
+                for module in reversed(moved_modules):
+                    self._move(module, "cpu")
+                if self.profile_memory:
+                    torch.cuda.synchronize(self.device)
+                offload_seconds = time.perf_counter() - offload_started
+
+                cache_clear_reason = None
+                cache_clear_seconds = 0.0
+                if self.device.type == "cuda":
+                    pre_clear_allocated = torch.cuda.memory_allocated(self.device)
+                    pre_clear_reserved = torch.cuda.memory_reserved(self.device)
+                else:
+                    pre_clear_allocated = 0
+                    pre_clear_reserved = 0
+                if moved_modules:
+                    stats = torch.cuda.memory_stats(self.device)
+                    inactive = stats.get("inactive_split_bytes.all.current", 0)
+                    cache_clear_reason = self._cache_clear_reason(
+                        pre_clear_allocated, pre_clear_reserved, inactive
+                    )
+                    if cache_clear_reason is not None:
+                        logger.info(
+                            "Clearing CUDA cache after stage {} ({}, {:.2f} GiB reclaimable)",
+                            name,
+                            cache_clear_reason,
+                            (pre_clear_reserved - pre_clear_allocated) / 1024**3,
+                        )
+                        cache_clear_started = time.perf_counter()
+                        torch.cuda.empty_cache()
+                        if self.profile_memory:
+                            torch.cuda.synchronize(self.device)
+                        cache_clear_seconds = (
+                            time.perf_counter() - cache_clear_started
+                        )
+                if self.profile_memory and measurement is not None:
+                    post_clear_allocated = torch.cuda.memory_allocated(self.device)
+                    post_clear_reserved = torch.cuda.memory_reserved(self.device)
+                    measurement.update(
+                        {
+                            "offload_seconds": offload_seconds,
+                            "cache_clear_seconds": cache_clear_seconds,
+                            "total_elapsed_seconds": time.perf_counter()
+                            - total_started,
+                            "ended_monotonic_seconds": time.perf_counter(),
+                            "pre_clear_allocated_bytes": pre_clear_allocated,
+                            "pre_clear_reserved_bytes": pre_clear_reserved,
+                            "post_offload_allocated_bytes": post_clear_allocated,
+                            "post_offload_reserved_bytes": post_clear_reserved,
+                            "reclaimed_reserved_bytes": max(
+                                0, pre_clear_reserved - post_clear_reserved
+                            ),
+                            "cache_cleared": cache_clear_reason is not None,
+                            "cache_clear_reason": cache_clear_reason,
+                        }
+                    )
+                    self.measurements.append(measurement)
+                    logger.info(
+                        "Stage {}: activate {:.3f}s, compute {:.3f}s, offload {:.3f}s, "
+                        "peak allocated {:.2f} GiB, peak reserved {:.2f} GiB",
+                        name,
+                        measurement["activation_seconds"],
+                        measurement["compute_seconds"],
+                        measurement["offload_seconds"],
+                        measurement["peak_allocated_bytes"] / 1024**3,
+                        measurement["peak_reserved_bytes"] / 1024**3,
+                    )
 
 
 class InferencePipeline:
@@ -67,7 +308,7 @@ class InferencePipeline:
         slat_decoder_gs_4_ckpt_path=None,
         ss_encoder_config_path=None,
         ss_encoder_ckpt_path=None,
-        decode_formats=["gaussian", "mesh"],
+        decode_formats=("mesh",),
         dtype="bfloat16",
         pad_size=1.0,
         version="v0",
@@ -91,17 +332,29 @@ class InferencePipeline:
         rendering_engine: str = "nvdiffrast",  # nvdiffrast OR pytorch3d,
         shape_model_dtype=None,
         compile_model=False,
+        memory_profile: MemoryProfile = "auto",
+        profile_memory=False,
         slat_mean=SLAT_MEAN,
         slat_std=SLAT_STD,
     ):
         self.rendering_engine = rendering_engine
         self.device = torch.device(device)
-        self.compile_model = compile_model
+        self.memory_profile = resolve_memory_profile(memory_profile, self.device)
+        self.low_vram = self.memory_profile == "low_vram"
+        self.compile_model = resolve_compile_model(compile_model, self.memory_profile)
+        self.load_device = torch.device("cpu") if self.low_vram else self.device
+        self.stage_residency = StageResidencyManager(
+            self.device, enabled=self.low_vram, profile_memory=profile_memory
+        )
         logger.info(f"self.device: {self.device}")
-        logger.info(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}")
-        logger.info(f"Actually using GPU: {torch.cuda.current_device()}")
-        with self.device:
-            self.decode_formats = decode_formats
+        logger.info(f"memory profile: {self.memory_profile}")
+        logger.info(
+            f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}"
+        )
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            logger.info(f"Actually using GPU: {torch.cuda.current_device()}")
+        with self.load_device:
+            self.decode_formats = normalize_output_formats(decode_formats)
             self.pad_size = pad_size
             self.version = version
             self.ss_condition_input_mapping = ss_condition_input_mapping
@@ -122,15 +375,29 @@ class InferencePipeline:
             if shape_model_dtype is None:
                 self.shape_model_dtype = self.dtype
             else:
-                self.shape_model_dtype = self._get_dtype(shape_model_dtype) 
-
+                self.shape_model_dtype = self._get_dtype(shape_model_dtype)
 
             # Setup preprocessors
-            self.pose_decoder = self.init_pose_decoder(ss_generator_config_path, pose_decoder_name)
-            self.ss_preprocessor = self.init_ss_preprocessor(ss_preprocessor, ss_generator_config_path)
+            self.pose_decoder = self.init_pose_decoder(
+                ss_generator_config_path, pose_decoder_name
+            )
+            self.ss_preprocessor = self.init_ss_preprocessor(
+                ss_preprocessor, ss_generator_config_path
+            )
             self.slat_preprocessor = slat_preprocessor
-    
+
+            self._decoder_specs = {
+                "mesh": (slat_decoder_mesh_config_path, slat_decoder_mesh_ckpt_path),
+                "gaussian": (slat_decoder_gs_config_path, slat_decoder_gs_ckpt_path),
+                "gaussian_4": (
+                    slat_decoder_gs_4_config_path,
+                    slat_decoder_gs_4_ckpt_path,
+                ),
+            }
+
             logger.info("Loading model weights...")
+            self._checkpoint_cache = {}
+            self._cache_checkpoints = True
 
             ss_generator = self.init_ss_generator(
                 ss_generator_config_path, ss_generator_ckpt_path
@@ -144,28 +411,28 @@ class InferencePipeline:
             ss_encoder = self.init_ss_encoder(
                 ss_encoder_config_path, ss_encoder_ckpt_path
             )
-            slat_decoder_gs = self.init_slat_decoder_gs(
-                slat_decoder_gs_config_path, slat_decoder_gs_ckpt_path
-            )
-            slat_decoder_gs_4 = self.init_slat_decoder_gs(
-                slat_decoder_gs_4_config_path, slat_decoder_gs_4_ckpt_path
-            )
-            slat_decoder_mesh = self.init_slat_decoder_mesh(
-                slat_decoder_mesh_config_path, slat_decoder_mesh_ckpt_path
-            )
-
             # Load conditioner embedder so that we only load it once
-            ss_condition_embedder = self.init_ss_condition_embedder(
-                ss_generator_config_path, ss_generator_ckpt_path
-            )
-            slat_condition_embedder = self.init_slat_condition_embedder(
-                slat_generator_config_path, slat_generator_ckpt_path
-            )
+            # Scope the weak construction cache to this pipeline. Live pipeline
+            # instances must not unexpectedly share a backbone whose device is
+            # controlled by another residency manager.
+            Dino._shared_backbones.clear()
+            try:
+                ss_condition_embedder = self.init_ss_condition_embedder(
+                    ss_generator_config_path, ss_generator_ckpt_path
+                )
+                slat_condition_embedder = self.init_slat_condition_embedder(
+                    slat_generator_config_path, slat_generator_ckpt_path
+                )
+            finally:
+                Dino._shared_backbones.clear()
 
             self.condition_embedders = {
                 "ss_condition_embedder": ss_condition_embedder,
                 "slat_condition_embedder": slat_condition_embedder,
             }
+            self._share_dino_backbones()
+            self._checkpoint_cache.clear()
+            self._cache_checkpoints = False
 
             # override generator and condition embedder setting
             self.override_ss_generator_cfg_config(
@@ -184,17 +451,16 @@ class InferencePipeline:
                 cfg_interval=slat_cfg_interval,
             )
 
-            self.models = torch.nn.ModuleDict(
-                {
-                    "ss_generator": ss_generator,
-                    "slat_generator": slat_generator,
-                    "ss_encoder": ss_encoder,
-                    "ss_decoder": ss_decoder,
-                    "slat_decoder_gs": slat_decoder_gs,
-                    "slat_decoder_gs_4": slat_decoder_gs_4,
-                    "slat_decoder_mesh": slat_decoder_mesh,
-                }
-            )
+            models = {
+                "ss_generator": ss_generator,
+                "slat_generator": slat_generator,
+                "ss_decoder": ss_decoder,
+            }
+            if ss_encoder is not None:
+                models["ss_encoder"] = ss_encoder
+            self.models = torch.nn.ModuleDict(models)
+            for output_format in self.decode_formats:
+                self._get_or_load_decoder(output_format)
             logger.info("Loading model weights completed!")
 
             if self.compile_model:
@@ -203,6 +469,117 @@ class InferencePipeline:
                 logger.info("Model compilation completed!")
             self.slat_mean = torch.tensor(slat_mean)
             self.slat_std = torch.tensor(slat_std)
+
+    def _iter_dino_embedders(self):
+        for condition_embedder in self.condition_embedders.values():
+            if condition_embedder is None:
+                continue
+            for embedder, _ in condition_embedder.embedder_list:
+                if isinstance(embedder, Dino):
+                    yield embedder
+
+    def _share_dino_backbones(self):
+        """All released checkpoints contain the same frozen DINO-ViT-L weights."""
+        dino_embedders = list(self._iter_dino_embedders())
+        if not dino_embedders:
+            return
+        shared_backbone = dino_embedders[0].backbone
+        for embedder in dino_embedders[1:]:
+            embedder.backbone = shared_backbone
+        logger.info(
+            "Sharing one DINO backbone across {} conditioning adapters",
+            len(dino_embedders),
+        )
+
+    def _start_condition_feature_cache(self):
+        if self.compile_model:
+            return None
+        cache = {}
+        for embedder in self._iter_dino_embedders():
+            embedder.feature_cache = cache
+        return cache
+
+    def _clear_condition_feature_cache(self):
+        for embedder in self._iter_dino_embedders():
+            embedder.feature_cache = None
+
+    @staticmethod
+    def _tree_to_device(value, device):
+        return tree_map_only(torch.Tensor, lambda tensor: tensor.to(device), value)
+
+    def prepare_conditioning(self, ss_input_dict, slat_input_dict):
+        """Encode both stage conditions before either generator becomes resident."""
+        modules = tuple(self.condition_embedders.values())
+        self._start_condition_feature_cache()
+        try:
+            with self.stage_residency.activate("conditioning", modules):
+                with torch.inference_mode(), torch.autocast(
+                    device_type=self.device.type,
+                    dtype=self.shape_model_dtype,
+                    enabled=self.device.type == "cuda",
+                ):
+                    ss_condition = self.get_condition_input(
+                        self.condition_embedders["ss_condition_embedder"],
+                        ss_input_dict,
+                        self.ss_condition_input_mapping,
+                    )
+                with torch.inference_mode(), torch.autocast(
+                    device_type=self.device.type,
+                    dtype=self.dtype,
+                    enabled=self.device.type == "cuda",
+                ):
+                    slat_condition = self.get_condition_input(
+                        self.condition_embedders["slat_condition_embedder"],
+                        slat_input_dict,
+                        self.slat_condition_input_mapping,
+                    )
+        finally:
+            self._clear_condition_feature_cache()
+
+        if self.low_vram:
+            ss_condition = self._tree_to_device(ss_condition, "cpu")
+            slat_condition = self._tree_to_device(slat_condition, "cpu")
+        return ss_condition, slat_condition
+
+    @staticmethod
+    def _share_identical_condition_inputs(ss_input, slat_input):
+        for key in set(ss_input).intersection(slat_input):
+            left, right = ss_input[key], slat_input[key]
+            if (
+                isinstance(left, torch.Tensor)
+                and isinstance(right, torch.Tensor)
+                and left.shape == right.shape
+                and left.dtype == right.dtype
+                and torch.equal(left, right)
+            ):
+                slat_input[key] = left
+
+    def _get_or_load_decoder(self, output_format: OutputFormat):
+        output_format = normalize_output_formats((output_format,))[0]
+        model_key = {
+            "mesh": "slat_decoder_mesh",
+            "gaussian": "slat_decoder_gs",
+            "gaussian_4": "slat_decoder_gs_4",
+        }[output_format]
+        if model_key in self.models:
+            return self.models[model_key]
+
+        config_path, ckpt_path = self._decoder_specs[output_format]
+        if config_path is None or ckpt_path is None:
+            raise ValueError(f"No decoder is configured for {output_format!r}")
+        logger.info("Lazy-loading {} decoder on {}", output_format, self.load_device)
+        with self.load_device:
+            if output_format == "mesh":
+                decoder = self.init_slat_decoder_mesh(config_path, ckpt_path)
+            else:
+                decoder = self.init_slat_decoder_gs(config_path, ckpt_path)
+        self.models[model_key] = decoder
+        return decoder
+
+    def get_memory_report(self):
+        return tuple(
+            dict(measurement) for measurement in self.stage_residency.measurements
+        )
 
     def _compile(self):
         torch._dynamo.config.cache_size_limit = 64
@@ -266,17 +643,28 @@ class InferencePipeline:
         ckpt_path,
         state_dict_fn=None,
         state_dict_key="state_dict",
-        device="cuda", 
+        device="cpu",
     ):
         model = instantiate(config)
 
         if ckpt_path.endswith(".safetensors"):
-            state_dict = load_file(ckpt_path, device="cuda")
+            state_dict = load_file(ckpt_path, device=str(device))
             if state_dict_fn is not None:
                 state_dict = state_dict_fn(state_dict)
             model.load_state_dict(state_dict, strict=False)
             model.eval()
         else:
+            checkpoint = None
+            if self._cache_checkpoints and os.path.isfile(ckpt_path):
+                checkpoint = self._checkpoint_cache.get(ckpt_path)
+                if checkpoint is None:
+                    checkpoint = torch.load(
+                        ckpt_path,
+                        map_location="cpu",
+                        weights_only=False,
+                        mmap=True,
+                    )
+                    self._checkpoint_cache[ckpt_path] = checkpoint
             model = load_model_from_checkpoint(
                 model,
                 ckpt_path,
@@ -286,6 +674,7 @@ class InferencePipeline:
                 eval=True,
                 state_dict_key=state_dict_key,
                 state_dict_fn=state_dict_fn,
+                checkpoint=checkpoint,
             )
         model = model.to(device)
 
@@ -293,14 +682,18 @@ class InferencePipeline:
 
     def init_pose_decoder(self, ss_generator_config_path, pose_decoder_name):
         if pose_decoder_name is None:
-            pose_decoder_name = OmegaConf.load(os.path.join(self.workspace_dir, ss_generator_config_path))["module"]["pose_target_convention"]
+            pose_decoder_name = OmegaConf.load(
+                os.path.join(self.workspace_dir, ss_generator_config_path)
+            )["module"]["pose_target_convention"]
         logger.info(f"Using pose decoder: {pose_decoder_name}")
         return get_pose_decoder(pose_decoder_name)
 
     def init_ss_preprocessor(self, ss_preprocessor, ss_generator_config_path):
         if ss_preprocessor is not None:
             return ss_preprocessor
-        config = OmegaConf.load(os.path.join(self.workspace_dir, ss_generator_config_path))["tdfy"]["val_preprocessor"]
+        config = OmegaConf.load(
+            os.path.join(self.workspace_dir, ss_generator_config_path)
+        )["tdfy"]["val_preprocessor"]
         return instantiate(config)
 
     def init_ss_generator(self, ss_generator_config_path, ss_generator_ckpt_path):
@@ -316,7 +709,7 @@ class InferencePipeline:
             config,
             os.path.join(self.workspace_dir, ss_generator_ckpt_path),
             state_dict_fn=state_dict_prefix_func,
-            device=self.device,
+            device=self.load_device,
         )
 
     def init_slat_generator(self, slat_generator_config_path, slat_generator_ckpt_path):
@@ -330,7 +723,7 @@ class InferencePipeline:
             config,
             os.path.join(self.workspace_dir, slat_generator_ckpt_path),
             state_dict_fn=state_dict_prefix_func,
-            device=self.device,
+            device=self.load_device,
         )
 
     def init_ss_encoder(self, ss_encoder_config_path, ss_encoder_ckpt_path):
@@ -344,7 +737,7 @@ class InferencePipeline:
             return self.instantiate_and_load_from_pretrained(
                 config,
                 os.path.join(self.workspace_dir, ss_encoder_ckpt_path),
-                device=self.device,
+                device=self.load_device,
                 state_dict_key=None,
             )
         else:
@@ -360,7 +753,7 @@ class InferencePipeline:
         return self.instantiate_and_load_from_pretrained(
             config,
             os.path.join(self.workspace_dir, ss_decoder_ckpt_path),
-            device=self.device,
+            device=self.load_device,
             state_dict_key=None,
         )
 
@@ -375,19 +768,21 @@ class InferencePipeline:
                     os.path.join(self.workspace_dir, slat_decoder_gs_config_path)
                 ),
                 os.path.join(self.workspace_dir, slat_decoder_gs_ckpt_path),
-                device=self.device,
+                device=self.load_device,
                 state_dict_key=None,
             )
 
     def init_slat_decoder_mesh(
         self, slat_decoder_mesh_config_path, slat_decoder_mesh_ckpt_path
     ):
+        config = OmegaConf.load(
+            os.path.join(self.workspace_dir, slat_decoder_mesh_config_path)
+        )
+        config["device"] = str(self.load_device)
         return self.instantiate_and_load_from_pretrained(
-            OmegaConf.load(
-                os.path.join(self.workspace_dir, slat_decoder_mesh_config_path)
-            ),
+            config,
             os.path.join(self.workspace_dir, slat_decoder_mesh_ckpt_path),
-            device=self.device,
+            device=self.load_device,
             state_dict_key=None,
         )
 
@@ -398,13 +793,18 @@ class InferencePipeline:
             os.path.join(self.workspace_dir, ss_generator_config_path)
         )
         if "condition_embedder" in conf["module"]:
+            backbone_config = conf["module"]["condition_embedder"]["backbone"]
+            for embedder_entry in backbone_config.get("embedder_list", ()):
+                embedder_config = embedder_entry[0]
+                if str(embedder_config.get("_target_", "")).endswith(".Dino"):
+                    embedder_config["share_backbone"] = True
             return self.instantiate_and_load_from_pretrained(
-                conf["module"]["condition_embedder"]["backbone"],
+                backbone_config,
                 os.path.join(self.workspace_dir, ss_generator_ckpt_path),
                 state_dict_fn=filter_and_remove_prefix_state_dict_fn(
                     "_base_models.condition_embedder."
                 ),
-                device=self.device,
+                device=self.load_device,
             )
         else:
             return None
@@ -415,7 +815,6 @@ class InferencePipeline:
         return self.init_ss_condition_embedder(
             slat_generator_config_path, slat_generator_ckpt_path
         )
-
 
     def override_ss_generator_cfg_config(
         self,
@@ -465,7 +864,6 @@ class InferencePipeline:
             rescale_t,
         )
 
-
     def run(
         self,
         image: Union[None, Image.Image, np.ndarray],
@@ -480,6 +878,8 @@ class InferencePipeline:
         use_stage1_distillation=False,
         use_stage2_distillation=False,
         decode_formats=None,
+        mesh_target_faces=None,
+        flat_shading=False,
     ) -> dict:
         """
         Parameters:
@@ -491,27 +891,44 @@ class InferencePipeline:
         Returns:
         - dict: A dictionary containing the GLB file and additional data from the sparse structure sampling.
         """
+        mesh_target_faces = normalize_mesh_target_faces(mesh_target_faces)
+        stage1_inference_steps = normalize_inference_steps(
+            stage1_inference_steps, "stage1_inference_steps"
+        )
+        stage2_inference_steps = normalize_inference_steps(
+            stage2_inference_steps, "stage2_inference_steps"
+        )
         # This should only happen if called from demo
         image = self.merge_image_and_mask(image, mask)
         with self.device:
             ss_input_dict = self.preprocess_image(image, self.ss_preprocessor)
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
+            self._share_identical_condition_inputs(ss_input_dict, slat_input_dict)
+            ss_condition, slat_condition = self.prepare_conditioning(
+                ss_input_dict, slat_input_dict
+            )
             torch.manual_seed(seed)
             ss_return_dict = self.sample_sparse_structure(
                 ss_input_dict,
                 inference_steps=stage1_inference_steps,
                 use_distillation=use_stage1_distillation,
+                prepared_condition=ss_condition,
             )
 
             ss_return_dict.update(self.pose_decoder(ss_return_dict))
 
             if "scale" in ss_return_dict:
-                logger.info(f"Rescaling scale by {ss_return_dict['downsample_factor']}")
-                ss_return_dict["scale"] = ss_return_dict["scale"] * ss_return_dict["downsample_factor"]
+                logger.info(
+                    f"Rescaling scale by {ss_return_dict['downsample_factor']}"
+                )
+                ss_return_dict["scale"] = (
+                    ss_return_dict["scale"] * ss_return_dict["downsample_factor"]
+                )
+            ss_return_dict = self._compact_sparse_outputs(ss_return_dict)
             if stage1_only:
                 logger.info("Finished!")
                 ss_return_dict["voxel"] = ss_return_dict["coords"][:, 1:] / 64 - 0.5
-                return ss_return_dict
+                return self._move_outputs_to_cpu(ss_return_dict)
 
             coords = ss_return_dict["coords"]
             slat = self.sample_slat(
@@ -519,30 +936,60 @@ class InferencePipeline:
                 coords,
                 inference_steps=stage2_inference_steps,
                 use_distillation=use_stage2_distillation,
+                prepared_condition=slat_condition,
             )
-            outputs = self.decode_slat(
-                slat, self.decode_formats if decode_formats is None else decode_formats
+
+            requested_formats = normalize_output_formats(
+                self.decode_formats if decode_formats is None else decode_formats
             )
+            decode_request = list(requested_formats)
+            if (
+                with_texture_baking
+                and "mesh" in requested_formats
+                and "gaussian" not in decode_request
+            ):
+                decode_request.append("gaussian")
+            outputs = self.decode_slat(slat, decode_request)
             outputs = self.postprocess_slat_output(
-                outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
+                outputs,
+                with_mesh_postprocess,
+                with_texture_baking,
+                use_vertex_color,
+                mesh_target_faces=mesh_target_faces,
+                flat_shading=flat_shading,
             )
             logger.info("Finished!")
 
-            return {
-                **ss_return_dict,
-                **outputs,
-            }
+            return self._move_outputs_to_cpu(
+                {
+                    **ss_return_dict,
+                    **outputs,
+                }
+            )
 
     def postprocess_slat_output(
-        self, outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
+        self,
+        outputs,
+        with_mesh_postprocess,
+        with_texture_baking,
+        use_vertex_color,
+        mesh_target_faces=None,
+        flat_shading=False,
     ):
         # GLB files can be extracted from the outputs
         logger.info(
             f"Postprocessing mesh with option with_mesh_postprocess {with_mesh_postprocess}, with_texture_baking {with_texture_baking}..."
         )
         if "mesh" in outputs:
+            appearance = outputs.get("gaussian")
+            if with_texture_baking and not appearance:
+                raise ValueError("Texture baking requires the gaussian output format")
+            if mesh_target_faces is not None:
+                outputs["mesh"][0] = postprocessing_utils.simplify_mesh_representation(
+                    outputs["mesh"][0], mesh_target_faces
+                )
             glb = postprocessing_utils.to_glb(
-                outputs["gaussian"][0],
+                appearance[0] if appearance else None,
                 outputs["mesh"][0],
                 # Optional parameters
                 simplify=0.95,  # Ratio of triangles to remove in the simplification process
@@ -551,6 +998,7 @@ class InferencePipeline:
                 with_mesh_postprocess=with_mesh_postprocess,
                 with_texture_baking=with_texture_baking,
                 use_vertex_color=use_vertex_color,
+                flat_shading=flat_shading,
                 rendering_engine=self.rendering_engine,
             )
 
@@ -591,7 +1039,7 @@ class InferencePipeline:
     def decode_slat(
         self,
         slat: sp.SparseTensor,
-        formats: List[str] = ["mesh", "gaussian"],
+        formats: Sequence[str] = ("mesh",),
     ) -> dict:
         """
         Decode the structured latent.
@@ -604,17 +1052,32 @@ class InferencePipeline:
             dict: The decoded structured latent.
         """
         logger.info("Decoding sparse latent...")
+        formats = normalize_output_formats(formats)
         ret = {}
-        with torch.no_grad():
-            if "mesh" in formats:
-                ret["mesh"] = self.models["slat_decoder_mesh"](slat)
-            if "gaussian" in formats:
-                ret["gaussian"] = self.models["slat_decoder_gs"](slat)
-            if "gaussian_4" in formats:
-                ret["gaussian_4"] = self.models["slat_decoder_gs_4"](slat)
+        for output_format in formats:
+            decoder = self._get_or_load_decoder(output_format)
+            with self.stage_residency.activate(f"decode_{output_format}", (decoder,)):
+                with torch.inference_mode():
+                    ret[output_format] = decoder(slat)
         # if "radiance_field" in formats:
         #     ret["radiance_field"] = self.models["slat_decoder_rf"](slat)
         return ret
+
+    def _move_outputs_to_cpu(self, outputs):
+        formats_to_move = SUPPORTED_OUTPUT_FORMATS if self.low_vram else ("mesh",)
+        for output_format in formats_to_move:
+            for value in outputs.get(output_format, ()):
+                if hasattr(value, "to"):
+                    value.to("cpu")
+        return tree_map_only(torch.Tensor, lambda tensor: tensor.cpu(), outputs)
+
+    def _compact_sparse_outputs(self, outputs):
+        if not self.low_vram:
+            return outputs
+        # The dense stage-one latent is only needed by the sparse decoder and
+        # pose decoder. Keeping it alive would overlap with stage two.
+        outputs.pop("shape", None)
+        return self._tree_to_device(outputs, "cpu")
 
     def is_mm_dit(self, model_name="ss_generator"):
         return hasattr(self.models[model_name].reverse_fn.backbone, "latent_mapping")
@@ -642,7 +1105,11 @@ class InferencePipeline:
         return condition_args, condition_kwargs
 
     def sample_sparse_structure(
-        self, ss_input_dict: dict, inference_steps=None, use_distillation=False
+        self,
+        ss_input_dict: dict,
+        inference_steps=None,
+        use_distillation=False,
+        prepared_condition=None,
     ):
         ss_generator = self.models["ss_generator"]
         ss_decoder = self.models["ss_decoder"]
@@ -670,54 +1137,64 @@ class InferencePipeline:
             ss_generator.reverse_fn.strength_pm,
         )
 
-        with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=self.shape_model_dtype):
-                if self.is_mm_dit():
-                    latent_shape_dict = {
-                        k: (bs,) + (v.pos_emb.shape[0], v.input_layer.in_features)
-                        for k, v in ss_generator.reverse_fn.backbone.latent_mapping.items()
-                    }
-                else:
-                    latent_shape_dict = (bs,) + (4096, 8)
+        stage_modules = (ss_generator, ss_decoder)
+        try:
+            with self.stage_residency.activate("sparse_structure", stage_modules):
+                with torch.inference_mode(), torch.autocast(
+                    device_type=self.device.type,
+                    dtype=self.shape_model_dtype,
+                    enabled=self.device.type == "cuda",
+                ):
+                    if self.is_mm_dit():
+                        latent_shape_dict = {
+                            k: (bs,) + (v.pos_emb.shape[0], v.input_layer.in_features)
+                            for k, v in ss_generator.reverse_fn.backbone.latent_mapping.items()
+                        }
+                    else:
+                        latent_shape_dict = (bs,) + (4096, 8)
 
-                condition_args, condition_kwargs = self.get_condition_input(
-                    self.condition_embedders["ss_condition_embedder"],
-                    ss_input_dict,
-                    self.ss_condition_input_mapping,
-                )
-                return_dict = ss_generator(
-                    latent_shape_dict,
-                    image.device,
-                    *condition_args,
-                    **condition_kwargs,
-                )
-                if not self.is_mm_dit():
-                    return_dict = {"shape": return_dict}
-
-                shape_latent = return_dict["shape"]
-                ss = ss_decoder(
-                    shape_latent.permute(0, 2, 1)
-                    .contiguous()
-                    .view(shape_latent.shape[0], 8, 16, 16, 16)
-                )
-                coords = torch.argwhere(ss > 0)[:, [0, 2, 3, 4]].int()
-
-                # downsample output
-                return_dict["coords_original"] = coords
-                original_shape = coords.shape
-                if self.downsample_ss_dist > 0:
-                    coords = prune_sparse_structure(
-                        coords,
-                        max_neighbor_axes_dist=self.downsample_ss_dist,
+                    if prepared_condition is None:
+                        condition_args, condition_kwargs = self.get_condition_input(
+                            self.condition_embedders["ss_condition_embedder"],
+                            ss_input_dict,
+                            self.ss_condition_input_mapping,
+                        )
+                    else:
+                        condition_args, condition_kwargs = self._tree_to_device(
+                            prepared_condition, self.device
+                        )
+                    return_dict = ss_generator(
+                        latent_shape_dict,
+                        image.device,
+                        *condition_args,
+                        **condition_kwargs,
                     )
-                coords, downsample_factor = downsample_sparse_structure(coords)
-                logger.info(
-                    f"Downsampled coords from {original_shape[0]} to {coords.shape[0]}"
-                )
-                return_dict["coords"] = coords
-                return_dict["downsample_factor"] = downsample_factor
+                    if not self.is_mm_dit():
+                        return_dict = {"shape": return_dict}
 
-        ss_generator.inference_steps = prev_inference_steps
+                    shape_latent = return_dict["shape"]
+                    ss = ss_decoder(
+                        shape_latent.permute(0, 2, 1)
+                        .contiguous()
+                        .view(shape_latent.shape[0], 8, 16, 16, 16)
+                    )
+                    coords = torch.argwhere(ss > 0)[:, [0, 2, 3, 4]].int()
+
+                    return_dict["coords_original"] = coords
+                    original_shape = coords.shape
+                    if self.downsample_ss_dist > 0:
+                        coords = prune_sparse_structure(
+                            coords,
+                            max_neighbor_axes_dist=self.downsample_ss_dist,
+                        )
+                    coords, downsample_factor = downsample_sparse_structure(coords)
+                    logger.info(
+                        f"Downsampled coords from {original_shape[0]} to {coords.shape[0]}"
+                    )
+                    return_dict["coords"] = coords
+                    return_dict["downsample_factor"] = downsample_factor
+        finally:
+            ss_generator.inference_steps = prev_inference_steps
         return return_dict
 
     def sample_slat(
@@ -726,6 +1203,7 @@ class InferencePipeline:
         coords: torch.Tensor,
         inference_steps=25,
         use_distillation=False,
+        prepared_condition=None,
     ) -> sp.SparseTensor:
         image = slat_input["image"]
         DEVICE = image.device
@@ -749,24 +1227,35 @@ class InferencePipeline:
             slat_generator.rescale_t,
         )
 
-        with torch.autocast(device_type="cuda", dtype=self.dtype):
-            with torch.no_grad():
-                condition_args, condition_kwargs = self.get_condition_input(
-                    self.condition_embedders["slat_condition_embedder"],
-                    slat_input,
-                    self.slat_condition_input_mapping,
-                )
-                condition_args += (coords.cpu().numpy(),)
-                slat = slat_generator(
-                    latent_shape, DEVICE, *condition_args, **condition_kwargs
-                )
-                slat = sp.SparseTensor(
-                    coords=coords,
-                    feats=slat[0],
-                ).to(DEVICE)
-                slat = slat * self.slat_std.to(DEVICE) + self.slat_mean.to(DEVICE)
-
-        slat_generator.inference_steps = prev_inference_steps
+        stage_modules = (slat_generator,)
+        try:
+            with self.stage_residency.activate("structured_latent", stage_modules):
+                with torch.inference_mode(), torch.autocast(
+                    device_type=self.device.type,
+                    dtype=self.dtype,
+                    enabled=self.device.type == "cuda",
+                ):
+                    if prepared_condition is None:
+                        condition_args, condition_kwargs = self.get_condition_input(
+                            self.condition_embedders["slat_condition_embedder"],
+                            slat_input,
+                            self.slat_condition_input_mapping,
+                        )
+                    else:
+                        condition_args, condition_kwargs = self._tree_to_device(
+                            prepared_condition, self.device
+                        )
+                    condition_args += (coords.cpu().numpy(),)
+                    slat = slat_generator(
+                        latent_shape, DEVICE, *condition_args, **condition_kwargs
+                    )
+                    slat = sp.SparseTensor(
+                        coords=coords,
+                        feats=slat[0],
+                    ).to(DEVICE)
+                    slat = slat * self.slat_std.to(DEVICE) + self.slat_mean.to(DEVICE)
+        finally:
+            slat_generator.inference_steps = prev_inference_steps
         return slat
 
     def _apply_transform(self, input: torch.Tensor, transform):
