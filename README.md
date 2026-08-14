@@ -130,6 +130,17 @@ For  more details and multi-object reconstruction, please take a look at out two
 * [single object](notebook/demo_single_object.ipynb)
 * [multi object](notebook/demo_multi_object.ipynb)
 
+## Text-prompted masks with SAM 3
+
+The optional `sam3_masking` integration accepts an arbitrary image and one or
+more text prompts, preserves every detected SAM 3 instance as an original-size
+boolean mask, and can feed each mask to SAM 3D as a separate mesh. SAM 3 runs in
+a dedicated process so it releases a 16 GB GPU before SAM 3D loads.
+
+See [the SAM 3 masking and prompt-to-mesh guide](doc/sam3-masking.md) for setup,
+offline model preparation using `/mnt/d/Data/models/sam3.safetensors`, Python
+usage, and the three new command-line tools.
+
 
 ## SAM 3D Body
 
