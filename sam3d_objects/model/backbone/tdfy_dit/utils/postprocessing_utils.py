@@ -343,6 +343,65 @@ def postprocess_mesh(
     return vertices, faces
 
 
+def simplify_mesh_representation(
+    mesh: MeshExtractResult,
+    target_faces: int,
+    verbose: bool = False,
+) -> MeshExtractResult:
+    """Simplify a decoded mesh on CPU while preserving per-vertex attributes."""
+    if target_faces <= 0:
+        raise ValueError("target_faces must be greater than zero")
+    if not mesh.success or mesh.faces.shape[0] <= target_faces:
+        return mesh
+
+    mesh.to("cpu")
+    vertices = mesh.vertices.detach().float().numpy()
+    faces = mesh.faces.detach().numpy()
+    vertex_attrs = None
+    if mesh.vertex_attrs is not None:
+        attrs = mesh.vertex_attrs.detach()
+        # VTK has no float16 array type; interpolate attributes in float32 and
+        # restore the checkpoint dtype after decimation.
+        if attrs.is_floating_point():
+            attrs = attrs.float()
+        vertex_attrs = attrs.numpy()
+    poly = pv.PolyData(
+        vertices,
+        np.concatenate([np.full((faces.shape[0], 1), 3), faces], axis=1),
+    )
+    if vertex_attrs is not None:
+        poly.point_data["vertex_attrs"] = vertex_attrs
+
+    original_faces = poly.n_cells
+    target_reduction = 1.0 - (target_faces / original_faces)
+    poly = poly.decimate(
+        target_reduction,
+        volume_preservation=True,
+        scalars=vertex_attrs is not None,
+        progress_bar=verbose,
+    )
+
+    vertex_dtype = mesh.vertices.dtype
+    attr_dtype = mesh.vertex_attrs.dtype if mesh.vertex_attrs is not None else None
+    mesh.vertices = torch.as_tensor(np.asarray(poly.points).copy(), dtype=vertex_dtype)
+    mesh.faces = torch.as_tensor(
+        np.asarray(poly.faces).reshape(-1, 4)[:, 1:].copy(), dtype=torch.long
+    )
+    if vertex_attrs is not None:
+        mesh.vertex_attrs = torch.as_tensor(
+            np.asarray(poly.point_data["vertex_attrs"]).copy(), dtype=attr_dtype
+        )
+    mesh.face_normal = mesh.comput_face_normals(mesh.vertices, mesh.faces)
+    mesh.success = mesh.vertices.shape[0] != 0 and mesh.faces.shape[0] != 0
+    logger.info(
+        "Simplified mesh from {} to {} faces (target {})",
+        original_faces,
+        mesh.faces.shape[0],
+        target_faces,
+    )
+    return mesh
+
+
 def parametrize_mesh(vertices: np.array, faces: np.array):
     """
     Parametrize a mesh to a texture space, using xatlas.
@@ -583,7 +642,7 @@ def bake_texture(
 
 
 def to_glb(
-    app_rep: Union[Strivec, Gaussian],
+    app_rep: Optional[Union[Strivec, Gaussian]],
     mesh: MeshExtractResult,
     simplify: float = 0.95,
     fill_holes: bool = True,
@@ -594,6 +653,7 @@ def to_glb(
     with_mesh_postprocess=True,
     with_texture_baking=True,
     use_vertex_color=False,
+    flat_shading=False,
     rendering_engine: str = "nvdiffrast",  # nvdiffrast OR "pytorch3d"
 ) -> trimesh.Trimesh:
     """
@@ -608,6 +668,7 @@ def to_glb(
         texture_size (int): Size of the texture.
         debug (bool): Whether to print debug information.
         verbose (bool): Whether to print progress.
+        flat_shading (bool): Duplicate vertices per face so exported normals are faceted.
     """
     vertices = mesh.vertices.float().cpu().numpy()
     faces = mesh.faces.cpu().numpy()
@@ -630,6 +691,8 @@ def to_glb(
         )
 
     if with_texture_baking:
+        if app_rep is None:
+            raise ValueError("Texture baking requires an appearance representation")
         # parametrize mesh
         vertices, faces, uvs = parametrize_mesh(vertices, faces)
         logger.info("Baking texture ...")
@@ -665,7 +728,11 @@ def to_glb(
     # rotate mesh (from z-up to y-up)
     vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
 
-    if not with_mesh_postprocess and not with_texture_baking and use_vertex_color:
+    if (
+        not with_texture_baking
+        and use_vertex_color
+        and len(vert_colors) == len(vertices)
+    ):
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
         mesh.visual.vertex_colors = vert_colors
     else:
@@ -678,6 +745,11 @@ def to_glb(
                 else None
             ),
         )
+
+    if flat_shading:
+        mesh.unmerge_vertices()
+        # Populate per-corner normals before GLB export.
+        _ = mesh.vertex_normals
 
     return mesh
 

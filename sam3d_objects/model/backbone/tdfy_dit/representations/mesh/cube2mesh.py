@@ -20,6 +20,21 @@ class MeshExtractResult:
         self.tsdf_s = None
         self.reg_loss = None
 
+    def to(self, device):
+        for name in (
+            "vertices",
+            "faces",
+            "vertex_attrs",
+            "face_normal",
+            "tsdf_v",
+            "tsdf_s",
+            "reg_loss",
+        ):
+            value = getattr(self, name, None)
+            if isinstance(value, torch.Tensor):
+                setattr(self, name, value.to(device))
+        return self
+
     def comput_face_normals(self, verts, faces):
         i0 = faces[..., 0].long()
         i1 = faces[..., 1].long()
@@ -66,6 +81,13 @@ class SparseFeatures2Mesh:
         self.reg_v = verts.to(self.device)
         self.use_color = use_color
         self._calc_layout()
+
+    def to(self, device):
+        self.device = torch.device(device)
+        self.reg_c = self.reg_c.to(self.device)
+        self.reg_v = self.reg_v.to(self.device)
+        self.mesh_extractor.to(self.device)
+        return self
 
     def _calc_layout(self):
         LAYOUTS = {

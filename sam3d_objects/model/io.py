@@ -154,13 +154,17 @@ def load_model_from_checkpoint(
     remove_name: Union[List[str], None] = None,
     state_dict_key: Union[None, str, Iterable[str]] = "state_dict",
     state_dict_fn: Optional[Callable[[Any], Any]] = None,
+    checkpoint: Optional[Any] = None,
 ):
     logger.info(f"Loading checkpoint from {checkpoint_path}")
-    if os.path.isfile(checkpoint_path):
+    if checkpoint is not None:
+        pass
+    elif os.path.isfile(checkpoint_path):
         checkpoint = torch.load(
             checkpoint_path,
             map_location=device,
             weights_only=False,
+            mmap=True,
         )
     elif os.path.isdir(checkpoint_path):  # sharded
         checkpoint = load_sharded_checkpoint(checkpoint_path, device=device)

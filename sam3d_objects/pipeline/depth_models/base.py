@@ -11,3 +11,8 @@ class DepthModel:
 
     def __call__(self, image):
         pass
+
+    def to(self, device):
+        self.device = torch.device(device)
+        self.model.to(self.device)
+        return self
