@@ -238,6 +238,139 @@ def test_tiled_tin_clips_concavity_and_keeps_disconnected_components():
     assert report["tile_count"] > 2
 
 
+def _surface_with_internal_gap():
+    rng = np.random.default_rng(4)
+    coordinates = []
+    for x in np.arange(0.0, 6.01, 0.2):
+        for y in np.arange(0.0, 2.01, 0.2):
+            if 2.7 < x < 3.3 and 0.4 < y < 1.6:
+                continue
+            jitter = rng.normal(0.0, 0.001, 2)
+            coordinates.append([x + jitter[0], y + jitter[1], 0.01 * x])
+    return np.asarray(coordinates, dtype=np.float64)
+
+
+def _gap_tin_config(**overrides):
+    values = {
+        "surface_resolution_m": 0.2,
+        "max_surface_range_m": None,
+        "max_triangle_edge_m": 0.35,
+        "max_slope_deg": 45.0,
+        "tin_tile_size_m": 3.0,
+    }
+    values.update(overrides)
+    return TinConfig(**values)
+
+
+def test_hole_filling_is_opt_in_width_limited_and_crosses_tile_seams():
+    points = _surface_with_internal_gap()
+    default_faces, default_report = triangulate_surface(points, _gap_tin_config())
+    disabled_faces, disabled_report = triangulate_surface(
+        points, _gap_tin_config(fill_holes=False)
+    )
+    narrow_faces, narrow_report = triangulate_surface(
+        points,
+        _gap_tin_config(fill_holes=True, max_hole_width_m=0.5),
+    )
+    filled_faces, filled_report = triangulate_surface(
+        points,
+        _gap_tin_config(fill_holes=True, max_hole_width_m=1.0),
+    )
+
+    np.testing.assert_array_equal(default_faces, disabled_faces)
+    assert not default_report["hole_fill"]["enabled"]
+    assert not disabled_report["hole_fill"]["evaluated"]
+    assert len(narrow_faces) == len(default_faces)
+    assert narrow_report["hole_fill"]["skipped_too_wide_count"] == 1
+    assert len(filled_faces) > len(default_faces)
+    assert filled_report["hole_fill"]["filled_region_count"] == 1
+    assert filled_report["hole_fill"]["filled_face_count"] == (
+        len(filled_faces) - len(default_faces)
+    )
+    assert filled_report["hole_fill"]["filled_width_m"]["maximum"] <= 1.0
+    assert filled_report["duplicate_face_count"] == 0
+    canonical = np.sort(filled_faces, axis=1)
+    assert len(np.unique(canonical, axis=0)) == len(filled_faces)
+
+
+def test_hole_filling_uses_width_instead_of_total_gap_area():
+    rng = np.random.default_rng(8)
+    coordinates = []
+    for x in np.arange(0.0, 6.01, 0.2):
+        for y in np.arange(0.0, 2.01, 0.2):
+            if 1.0 < x < 5.0 and 0.7 < y < 1.3:
+                continue
+            jitter = rng.normal(0.0, 0.001, 2)
+            coordinates.append([x + jitter[0], y + jitter[1], 0.0])
+    points = np.asarray(coordinates, dtype=np.float64)
+
+    baseline, _ = triangulate_surface(points, _gap_tin_config())
+    repaired, report = triangulate_surface(
+        points,
+        _gap_tin_config(fill_holes=True, max_hole_width_m=1.0),
+    )
+
+    assert len(repaired) > len(baseline)
+    assert report["hole_fill"]["filled_region_count"] >= 1
+    assert report["hole_fill"]["filled_width_m"]["maximum"] <= 1.0
+
+
+def test_hole_filling_preserves_exterior_concavities_and_disconnected_surfaces():
+    points = _l_shaped_surface()
+    baseline, _ = triangulate_surface(
+        points,
+        TinConfig(
+            surface_resolution_m=0.2,
+            max_surface_range_m=None,
+            max_triangle_edge_m=0.45,
+            tin_tile_size_m=12.0,
+        ),
+    )
+    repaired, report = triangulate_surface(
+        points,
+        TinConfig(
+            surface_resolution_m=0.2,
+            max_surface_range_m=None,
+            max_triangle_edge_m=0.45,
+            tin_tile_size_m=12.0,
+            fill_holes=True,
+            max_hole_width_m=5.0,
+        ),
+    )
+
+    assert len(repaired) == len(baseline)
+    assert report["hole_fill"]["filled_face_count"] == 0
+    assert report["hole_fill"]["exterior_region_count"] > 0
+    assert report["components"]["count"] == 2
+
+
+def test_hole_filling_does_not_restore_steep_rejected_faces():
+    points = np.asarray(
+        [
+            [x, y, 2.0 if x == 1.0 and y == 1.0 else 0.0]
+            for x in np.arange(0.0, 2.01, 0.2)
+            for y in np.arange(0.0, 2.01, 0.2)
+        ],
+        dtype=np.float64,
+    )
+    _, report = triangulate_surface(
+        points,
+        TinConfig(
+            surface_resolution_m=0.2,
+            max_surface_range_m=None,
+            max_triangle_edge_m=0.35,
+            tin_tile_size_m=5.0,
+            fill_holes=True,
+            max_hole_width_m=1.0,
+        ),
+    )
+
+    assert report["rejected_faces"]["slope"] > 0
+    assert report["hole_fill"]["enclosed_region_count"] == 1
+    assert report["hole_fill"]["filled_face_count"] == 0
+    assert report["hole_fill"]["skipped_unsafe_count"] == 1
+
+
 def test_tin_rejects_collinear_and_excessively_steep_surfaces():
     with pytest.raises(ValueError, match="collinear"):
         triangulate_surface(
@@ -276,14 +409,7 @@ def test_build_exports_colored_glb_metadata_and_resumes_without_sam3(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _write_build_manifest(run_dir)
-    points = np.asarray(
-        [
-            [x, y, 0.05 * x]
-            for x in np.arange(0, 1.01, 0.2)
-            for y in np.arange(0, 1.01, 0.2)
-        ],
-        dtype=np.float32,
-    )
+    points = _surface_with_internal_gap().astype(np.float32)
     colors = np.tile(np.asarray([[90, 80, 70]], dtype=np.uint8), (len(points), 1))
     point_set = SurfacePointSet(
         points,
@@ -295,9 +421,12 @@ def test_build_exports_colored_glb_metadata_and_resumes_without_sam3(
         lambda *args, **kwargs: point_set,
     )
     config = TinConfig(
+        surface_resolution_m=0.2,
         max_surface_range_m=None,
-        max_triangle_edge_m=0.5,
-        tin_tile_size_m=2.0,
+        max_triangle_edge_m=0.35,
+        tin_tile_size_m=3.0,
+        fill_holes=True,
+        max_hole_width_m=1.0,
     )
 
     outputs = build_surface_tin(run_dir, config)
@@ -310,11 +439,16 @@ def test_build_exports_colored_glb_metadata_and_resumes_without_sam3(
     assert len(scene.geometry) == 1
     mesh = next(iter(scene.geometry.values()))
     assert len(mesh.faces) > 0
+    assert not mesh.is_watertight
+    assert np.all(mesh.face_normals[:, 2] > 0)
     np.testing.assert_array_equal(mesh.visual.vertex_colors[0, :3], [90, 80, 70])
     metadata = json.loads(outputs.metadata.read_text())
     assert metadata["status"] == "complete"
     assert metadata["prompts"] == ["paved carriageway"]
     assert metadata["world_from_glb"] == np.eye(4).tolist()
+    assert metadata["triangulation"]["hole_fill"]["filled_region_count"] == 1
+    assert metadata["triangulation"]["hole_fill"]["filled_face_count"] > 0
+    assert len(mesh.faces) == metadata["triangulation"]["face_count"]
     manifest = json.loads((run_dir / "route-manifest.json").read_text())
     assert manifest["outputs"]["scene_glb"] == "scene.glb"
     assert manifest["outputs"]["surface_glb"] == "surface/surface.glb"
@@ -366,13 +500,44 @@ def test_failed_build_writes_diagnostics_without_stale_glb(tmp_path, monkeypatch
         {"surface_resolution_m": 0},
         {"max_surface_range_m": 0},
         {"max_triangle_edge_m": -1},
+        {"max_hole_width_m": 0},
         {"max_slope_deg": 90},
         {"tin_tile_size_m": 2, "max_triangle_edge_m": 1},
+        {
+            "fill_holes": True,
+            "max_triangle_edge_m": 1,
+            "max_hole_width_m": 2,
+            "tin_tile_size_m": 6,
+        },
     ],
 )
 def test_tin_config_rejects_invalid_values(kwargs):
     with pytest.raises(ValueError):
         TinConfig(**kwargs)
+
+
+def test_surface_cli_hole_fill_options_are_opt_in():
+    parser = build_parser()
+    defaults = parser.parse_args(["surface", "build", "run"])
+    enabled = parser.parse_args(
+        [
+            "surface",
+            "build",
+            "run",
+            "--fill-holes",
+            "--max-hole-width-m",
+            "1.5",
+        ]
+    )
+    disabled = parser.parse_args(
+        ["surface", "build", "run", "--no-fill-holes"]
+    )
+
+    assert defaults.fill_holes is False
+    assert defaults.max_hole_width_m == 1.0
+    assert enabled.fill_holes is True
+    assert enabled.max_hole_width_m == 1.5
+    assert disabled.fill_holes is False
 
 
 @pytest.mark.gpu

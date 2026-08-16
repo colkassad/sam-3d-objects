@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 from PIL import Image
+from scipy.ndimage import distance_transform_edt
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import Delaunay, QhullError, cKDTree
@@ -66,12 +67,15 @@ class TinConfig:
     max_triangle_edge_m: float = 1.0
     max_slope_deg: float = 45.0
     tin_tile_size_m: float = 50.0
+    fill_holes: bool = False
+    max_hole_width_m: float = 1.0
 
     def __post_init__(self) -> None:
         for name in (
             "surface_resolution_m",
             "max_triangle_edge_m",
             "tin_tile_size_m",
+            "max_hole_width_m",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
@@ -85,6 +89,13 @@ class TinConfig:
         if self.tin_tile_size_m <= 2.0 * self.max_triangle_edge_m:
             raise ValueError(
                 "tin_tile_size_m must be greater than twice max_triangle_edge_m"
+            )
+        repair_overlap = self.max_triangle_edge_m + self.max_hole_width_m
+        if self.fill_holes and self.tin_tile_size_m <= 2.0 * repair_overlap:
+            raise ValueError(
+                "tin_tile_size_m must be greater than twice the sum of "
+                "max_triangle_edge_m and max_hole_width_m when hole filling "
+                "is enabled"
             )
 
     def manifest_value(self) -> dict[str, Any]:
@@ -394,6 +405,247 @@ def _component_statistics(vertices: np.ndarray, faces: np.ndarray) -> dict[str, 
     }
 
 
+def _width_statistics(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {"count": 0, "minimum": None, "median": None, "maximum": None}
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "count": len(values),
+        "minimum": float(np.min(array)),
+        "median": float(np.median(array)),
+        "maximum": float(np.max(array)),
+    }
+
+
+def _rasterized_region_width(
+    xy: np.ndarray,
+    faces: np.ndarray,
+    *,
+    surface_resolution_m: float,
+    max_hole_width_m: float,
+) -> float:
+    """Approximate the full local thickness of a triangle region in XY."""
+
+    triangles = xy[np.asarray(faces, dtype=np.int64)]
+    cell_size = min(surface_resolution_m * 0.5, max_hole_width_m * 0.1)
+    low = np.min(triangles.reshape(-1, 2), axis=0) - cell_size
+    high = np.max(triangles.reshape(-1, 2), axis=0) + cell_size
+    shape_xy = np.ceil((high - low) / cell_size).astype(np.int64) + 1
+    # Extremely small requested widths can otherwise make even an obviously
+    # too-large hole allocate an unbounded temporary raster.
+    if int(shape_xy[0]) * int(shape_xy[1]) > 4_000_000:
+        return max_hole_width_m + cell_size
+    mask = np.zeros((int(shape_xy[1]), int(shape_xy[0])), dtype=bool)
+    epsilon = max(1e-12, cell_size**2 * 1e-9)
+    for triangle in triangles:
+        start = np.maximum(
+            np.floor((np.min(triangle, axis=0) - low) / cell_size).astype(np.int64),
+            0,
+        )
+        stop = np.minimum(
+            np.ceil((np.max(triangle, axis=0) - low) / cell_size).astype(np.int64)
+            + 1,
+            shape_xy,
+        )
+        if np.any(stop <= start):
+            continue
+        columns = np.arange(start[0], stop[0])
+        rows = np.arange(start[1], stop[1])
+        grid_x, grid_y = np.meshgrid(columns, rows)
+        samples = np.stack(
+            (
+                low[0] + (grid_x + 0.5) * cell_size,
+                low[1] + (grid_y + 0.5) * cell_size,
+            ),
+            axis=-1,
+        )
+        edge0 = triangle[1] - triangle[0]
+        edge1 = triangle[2] - triangle[1]
+        edge2 = triangle[0] - triangle[2]
+        cross0 = edge0[0] * (samples[..., 1] - triangle[0, 1]) - edge0[1] * (
+            samples[..., 0] - triangle[0, 0]
+        )
+        cross1 = edge1[0] * (samples[..., 1] - triangle[1, 1]) - edge1[1] * (
+            samples[..., 0] - triangle[1, 0]
+        )
+        cross2 = edge2[0] * (samples[..., 1] - triangle[2, 1]) - edge2[1] * (
+            samples[..., 0] - triangle[2, 0]
+        )
+        inside = (
+            (cross0 >= -epsilon) & (cross1 >= -epsilon) & (cross2 >= -epsilon)
+        ) | ((cross0 <= epsilon) & (cross1 <= epsilon) & (cross2 <= epsilon))
+        mask[start[1] : stop[1], start[0] : stop[0]] |= inside
+    if not np.any(mask):
+        return 0.0
+    half_width = float(np.max(distance_transform_edt(mask, sampling=cell_size)))
+    return max(0.0, 2.0 * half_width - cell_size)
+
+
+def _fill_narrow_holes(
+    vertices: np.ndarray,
+    candidate_faces: np.ndarray,
+    accepted: np.ndarray,
+    safe: np.ndarray,
+    config: TinConfig,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Select enclosed rejected-face regions eligible for conservative repair."""
+
+    pre_repair_count = int(np.count_nonzero(accepted))
+    report: dict[str, Any] = {
+        "enabled": config.fill_holes,
+        "max_hole_width_m": config.max_hole_width_m,
+        "evaluated": config.fill_holes,
+        "rejected_region_count": 0,
+        "enclosed_region_count": 0,
+        "exterior_region_count": 0,
+        "filled_region_count": 0,
+        "filled_face_count": 0,
+        "skipped_too_wide_count": 0,
+        "skipped_unsafe_count": 0,
+        "pre_repair_face_count": pre_repair_count,
+        "final_face_count": pre_repair_count,
+        "filled_width_m": _width_statistics([]),
+        "skipped_width_m": _width_statistics([]),
+    }
+    if not config.fill_holes:
+        return np.empty((0, 3), dtype=np.int64), report
+
+    candidates = np.asarray(candidate_faces, dtype=np.int64).reshape(-1, 3)
+    accepted = np.asarray(accepted, dtype=bool).reshape(-1)
+    safe = np.asarray(safe, dtype=bool).reshape(-1)
+    canonical = np.sort(candidates, axis=1)
+    _, first, inverse = np.unique(
+        canonical, axis=0, return_index=True, return_inverse=True
+    )
+    unique_faces = candidates[first]
+    unique_accepted = np.zeros(len(first), dtype=bool)
+    np.logical_or.at(unique_accepted, inverse, accepted)
+    unique_safe = np.ones(len(first), dtype=bool)
+    np.logical_and.at(unique_safe, inverse, safe)
+
+    rejected_faces = np.flatnonzero(~unique_accepted)
+    if not len(rejected_faces):
+        return np.empty((0, 3), dtype=np.int64), report
+    rejected_position = np.full(len(unique_faces), -1, dtype=np.int64)
+    rejected_position[rejected_faces] = np.arange(len(rejected_faces))
+
+    edges = np.vstack(
+        (
+            unique_faces[:, [0, 1]],
+            unique_faces[:, [1, 2]],
+            unique_faces[:, [2, 0]],
+        )
+    )
+    edge_faces = np.tile(np.arange(len(unique_faces), dtype=np.int64), 3)
+    edge_canonical = np.sort(edges, axis=1)
+    _, edge_inverse, edge_counts = np.unique(
+        edge_canonical, axis=0, return_inverse=True, return_counts=True
+    )
+    edge_order = np.argsort(edge_inverse, kind="stable")
+    edge_offsets = np.concatenate(([0], np.cumsum(edge_counts)))
+    pair_edges = np.flatnonzero(edge_counts == 2)
+    pair_left = edge_faces[edge_order[edge_offsets[pair_edges]]]
+    pair_right = edge_faces[edge_order[edge_offsets[pair_edges] + 1]]
+
+    both_rejected = (~unique_accepted[pair_left]) & (~unique_accepted[pair_right])
+    reject_rows = rejected_position[pair_left[both_rejected]]
+    reject_columns = rejected_position[pair_right[both_rejected]]
+    reject_graph = coo_matrix(
+        (
+            np.ones(2 * len(reject_rows), dtype=np.uint8),
+            (
+                np.concatenate((reject_rows, reject_columns)),
+                np.concatenate((reject_columns, reject_rows)),
+            ),
+        ),
+        shape=(len(rejected_faces), len(rejected_faces)),
+    ).tocsr()
+    region_count, region_labels = connected_components(reject_graph, directed=False)
+    report["rejected_region_count"] = int(region_count)
+
+    both_accepted = unique_accepted[pair_left] & unique_accepted[pair_right]
+    accepted_rows = pair_left[both_accepted]
+    accepted_columns = pair_right[both_accepted]
+    accepted_graph = coo_matrix(
+        (
+            np.ones(2 * len(accepted_rows), dtype=np.uint8),
+            (
+                np.concatenate((accepted_rows, accepted_columns)),
+                np.concatenate((accepted_columns, accepted_rows)),
+            ),
+        ),
+        shape=(len(unique_faces), len(unique_faces)),
+    ).tocsr()
+    _, accepted_labels = connected_components(accepted_graph, directed=False)
+
+    exterior_regions: set[int] = set()
+    boundary_edges = np.flatnonzero(edge_counts == 1)
+    boundary_faces = edge_faces[edge_order[edge_offsets[boundary_edges]]]
+    boundary_rejected = boundary_faces[~unique_accepted[boundary_faces]]
+    exterior_regions.update(
+        int(value) for value in region_labels[rejected_position[boundary_rejected]]
+    )
+
+    unsafe_regions: set[int] = set()
+    unsafe_faces = rejected_faces[~unique_safe[rejected_faces]]
+    unsafe_regions.update(
+        int(value) for value in region_labels[rejected_position[unsafe_faces]]
+    )
+    nonmanifold_edges = np.flatnonzero(edge_counts > 2)
+    for edge_index in nonmanifold_edges:
+        incident = edge_faces[
+            edge_order[edge_offsets[edge_index] : edge_offsets[edge_index + 1]]
+        ]
+        incident = incident[~unique_accepted[incident]]
+        unsafe_regions.update(
+            int(value) for value in region_labels[rejected_position[incident]]
+        )
+
+    adjacent_components: dict[int, set[int]] = {}
+    cross = unique_accepted[pair_left] != unique_accepted[pair_right]
+    for left, right in zip(pair_left[cross], pair_right[cross]):
+        rejected = right if unique_accepted[left] else left
+        accepted_face = left if unique_accepted[left] else right
+        region = int(region_labels[rejected_position[rejected]])
+        adjacent_components.setdefault(region, set()).add(
+            int(accepted_labels[accepted_face])
+        )
+
+    restored: list[np.ndarray] = []
+    filled_widths: list[float] = []
+    skipped_widths: list[float] = []
+    for region in range(region_count):
+        members = rejected_faces[region_labels == region]
+        if region in exterior_regions:
+            report["exterior_region_count"] += 1
+            continue
+        report["enclosed_region_count"] += 1
+        if region in unsafe_regions or len(adjacent_components.get(region, set())) != 1:
+            report["skipped_unsafe_count"] += 1
+            continue
+        width = _rasterized_region_width(
+            vertices[:, :2],
+            unique_faces[members],
+            surface_resolution_m=config.surface_resolution_m,
+            max_hole_width_m=config.max_hole_width_m,
+        )
+        if width > config.max_hole_width_m:
+            report["skipped_too_wide_count"] += 1
+            skipped_widths.append(width)
+            continue
+        restored.append(unique_faces[members])
+        filled_widths.append(width)
+        report["filled_region_count"] += 1
+        report["filled_face_count"] += len(members)
+
+    report["filled_width_m"] = _width_statistics(filled_widths)
+    report["skipped_width_m"] = _width_statistics(skipped_widths)
+    report["final_face_count"] = pre_repair_count + report["filled_face_count"]
+    if not restored:
+        return np.empty((0, 3), dtype=np.int64), report
+    return np.concatenate(restored).astype(np.int64, copy=False), report
+
+
 def triangulate_surface(
     points: np.ndarray, config: TinConfig
 ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -426,10 +678,15 @@ def triangulate_surface(
         "support": 0,
     }
     accepted: list[np.ndarray] = []
+    hole_candidates: list[np.ndarray] = []
+    hole_candidate_accepted: list[np.ndarray] = []
+    hole_candidate_safe: list[np.ndarray] = []
     raw_simplices = 0
     candidate_faces = 0
     qhull_failures = 0
     overlap = config.max_triangle_edge_m
+    if config.fill_holes:
+        overlap += config.max_hole_width_m
     area_epsilon = max(1e-12, config.surface_resolution_m**2 * 1e-6)
 
     for tile_key in sorted(bins):
@@ -488,6 +745,7 @@ def triangulate_surface(
         keep = slopes <= config.max_slope_deg
         rejection["slope"] += int(np.count_nonzero(valid & ~keep))
         valid &= keep
+        safe_for_hole_fill = valid.copy()
 
         edges_xy = np.stack(
             (
@@ -524,6 +782,9 @@ def triangulate_surface(
         keep = np.max(support_distances, axis=1) <= 1.5 * local
         rejection["support"] += int(np.count_nonzero(valid & ~keep))
         valid &= keep
+        hole_candidates.append(mapped.copy())
+        hole_candidate_accepted.append(valid.copy())
+        hole_candidate_safe.append(safe_for_hole_fill)
         selected = mapped[valid].copy()
         selected_normals = normals[valid]
         downward = selected_normals[:, 2] < 0
@@ -543,6 +804,28 @@ def triangulate_surface(
     faces = faces[np.sort(unique_indices)]
     if not len(faces):
         raise RuntimeError("surface triangulation produced no unique faces")
+    restored, hole_fill = _fill_narrow_holes(
+        vertices,
+        np.concatenate(hole_candidates),
+        np.concatenate(hole_candidate_accepted),
+        np.concatenate(hole_candidate_safe),
+        config,
+    )
+    if len(restored):
+        restored_normals = np.cross(
+            vertices[restored[:, 1]] - vertices[restored[:, 0]],
+            vertices[restored[:, 2]] - vertices[restored[:, 0]],
+        )
+        downward = restored_normals[:, 2] < 0
+        restored[downward, 1], restored[downward, 2] = (
+            restored[downward, 2].copy(),
+            restored[downward, 1].copy(),
+        )
+        faces = np.vstack((faces, restored))
+        canonical = np.sort(faces, axis=1)
+        _, unique_indices = np.unique(canonical, axis=0, return_index=True)
+        faces = faces[np.sort(unique_indices)]
+    hole_fill["final_face_count"] = len(faces)
     components = _component_statistics(vertices, faces)
     return faces, {
         "tile_count": len(bins),
@@ -551,6 +834,7 @@ def triangulate_surface(
         "candidate_face_count": candidate_faces,
         "face_count": len(faces),
         "duplicate_face_count": duplicate_faces,
+        "hole_fill": hole_fill,
         "rejected_faces": rejection,
         "local_spacing_m": {
             "minimum": float(np.min(spacing)),
