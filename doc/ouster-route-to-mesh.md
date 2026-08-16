@@ -199,15 +199,22 @@ sam3d-ouster-route surface build outputs/road-surface \
   --max-surface-range-m 30 \
   --max-triangle-edge-m 1.0 \
   --max-slope-deg 45 \
-  --tin-tile-size-m 50
+  --tin-tile-size-m 50 \
+  --fill-holes \
+  --max-hole-width-m 1.0
 ```
 
 Use `--no-max-surface-range` to retain all valid masked ranges. Reducing
 `--surface-resolution-m` retains more detail but increases point count,
 triangulation memory, and GLB size. The triangulation is tiled and uses local
 point spacing, a hard edge limit, slope filtering, and centroid/edge-midpoint
-support checks. It deliberately leaves unsupported gaps open instead of
-filling them or extending triangles past the observed shoulders.
+support checks. Hole filling is disabled by default. With `--fill-holes`, a
+second pass can restore complete enclosed rejected-face regions no wider than
+`--max-hole-width-m` (1 metre by default). Regions touching the triangulation
+exterior, spanning disconnected road components, or containing steep or
+degenerate faces remain open, so the repair does not close the road shoulders.
+When enabled, the tile size must exceed twice the sum of the triangle-edge and
+hole-width limits so repaired gaps have adequate overlap at tile seams.
 
 Surface-owned artifacts do not replace object masks, tracks, or scenes:
 

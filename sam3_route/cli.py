@@ -167,6 +167,18 @@ def _add_tin_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-triangle-edge-m", type=float, default=1.0)
     parser.add_argument("--max-slope-deg", type=float, default=45.0)
     parser.add_argument("--tin-tile-size-m", type=float, default=50.0)
+    parser.add_argument(
+        "--fill-holes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fill narrow enclosed TIN gaps without closing exterior shoulders.",
+    )
+    parser.add_argument(
+        "--max-hole-width-m",
+        type=float,
+        default=1.0,
+        help="Maximum full width of an enclosed gap eligible for filling.",
+    )
 
 
 def _add_reconstruct_options(parser: argparse.ArgumentParser) -> None:
@@ -349,6 +361,8 @@ def _tin_config(args: argparse.Namespace) -> TinConfig:
         max_triangle_edge_m=args.max_triangle_edge_m,
         max_slope_deg=args.max_slope_deg,
         tin_tile_size_m=args.tin_tile_size_m,
+        fill_holes=args.fill_holes,
+        max_hole_width_m=args.max_hole_width_m,
     )
 
 
