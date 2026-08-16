@@ -44,6 +44,7 @@ def test_route_parser_exposes_stages_and_aggressive_mesh_defaults():
         ["track", "output", "--max-mesh-range-m", "12.5", "--overwrite"]
     )
     reconstruct = parser.parse_args(["reconstruct", "output"])
+    scene_build = parser.parse_args(["scene", "build", "output"])
     surface_run = parser.parse_args(
         [
             "surface",
@@ -69,6 +70,10 @@ def test_route_parser_exposes_stages_and_aggressive_mesh_defaults():
     assert run_window.start_frame == 301
     assert run_window.stop_frame == 400
     assert segment.dynamic_min_speed_mps == 0.5
+    assert segment.suppress_duplicate_tracks is True
+    assert segment.duplicate_track_max_centroid_m == 1.0
+    assert segment.duplicate_track_min_shared_fraction == 0.50
+    assert segment.duplicate_track_min_containment == 0.30
     assert segment.max_mesh_range_m == 30.0
     assert track.dynamic_min_speed_mps == 0.5
     assert track.max_mesh_range_m == 30.0
@@ -88,6 +93,13 @@ def test_route_parser_exposes_stages_and_aggressive_mesh_defaults():
     assert reconstruct.fit_grounded is True
     assert reconstruct.fit_align_long_axis is True
     assert reconstruct.fit_max_up_tilt_deg == 20.0
+    assert reconstruct.suppress_overlapping_meshes is True
+    assert reconstruct.mesh_overlap_min_iou == 0.35
+    assert reconstruct.mesh_overlap_min_containment == 0.75
+    assert reconstruct.mesh_vertical_overlap_min == 0.50
+    assert reconstruct.mesh_overlap_resolution_m == 0.10
+    assert scene_build.scene_command == "build"
+    assert scene_build.suppress_overlapping_meshes is True
     assert surface_run.surface_command == "run"
     assert surface_run.keyframe_distance_m == 1.0
     assert surface_run.prompt == ["dirt track"]
@@ -100,5 +112,13 @@ def test_route_parser_exposes_stages_and_aggressive_mesh_defaults():
 
     disabled = parser.parse_args(["reconstruct", "output", "--fit-mode", "none"])
     assert disabled.fit_mode == "none"
+    duplicate_disabled = parser.parse_args(
+        ["track", "output", "--no-suppress-duplicate-tracks"]
+    )
+    overlap_disabled = parser.parse_args(
+        ["scene", "build", "output", "--no-suppress-overlapping-meshes"]
+    )
+    assert duplicate_disabled.suppress_duplicate_tracks is False
+    assert overlap_disabled.suppress_overlapping_meshes is False
     with pytest.raises(SystemExit):
         parser.parse_args(["reconstruct", "output", "--fit-mode", "legacy"])

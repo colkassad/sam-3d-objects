@@ -423,6 +423,7 @@ def extract_route(
         manifest["source_window"] = None
         manifest.get("stages", {}).pop("segment", None)
         manifest.get("stages", {}).pop("reconstruct", None)
+        manifest.get("stages", {}).pop("scene_compose", None)
         manifest.get("stages", {}).pop("surface_segment", None)
         manifest.get("stages", {}).pop("surface_tin", None)
         manifest["surface_prompts"] = []

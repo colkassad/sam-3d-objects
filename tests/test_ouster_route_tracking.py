@@ -26,6 +26,8 @@ from sam3_route.tracking import (
     associate_observations,
     build_tracks,
     dominant_depth_component,
+    duplicate_track_evidence,
+    suppress_duplicate_track_documents,
 )
 
 
@@ -217,6 +219,128 @@ def test_mesh_range_defaults_to_thirty_metres_and_can_be_disabled():
 
     assert default.max_mesh_range_m == 30.0
     assert unlimited.max_mesh_range_m is None
+
+
+def _duplicate_track(identifier, observations, *, primary=True, prompt="car"):
+    values = []
+    for observation in observations:
+        value = vars(observation).copy()
+        value["depth_candidate_rank"] = 0 if primary else 1
+        value["inlier_fraction"] = 0.95 if primary else 0.35
+        value["valid_depth_fraction"] = 0.95 if primary else 0.45
+        value["score"] = 0.90 if primary else 0.70
+        values.append(value)
+    return {
+        "id": identifier,
+        "prompt": prompt,
+        "status": "pending",
+        "motion_state": "confirmed_static",
+        "range_gate": {"eligible": True},
+        "centroid_world": np.median(
+            [value["centroid_world"] for value in values], axis=0
+        ).tolist(),
+        "observations": values,
+    }
+
+
+def test_duplicate_track_suppression_keeps_stronger_depth_support():
+    strong = _duplicate_track(
+        "track-strong",
+        [make_observation("a1", 1, 0.0), make_observation("a2", 2, 0.1)],
+    )
+    weak = _duplicate_track(
+        "track-weak",
+        [make_observation("b1", 1, 0.2), make_observation("b2", 2, 0.3)],
+        primary=False,
+    )
+    config = SegmentConfig(prompts=("car",), sam3_model_dir="model")
+
+    report = suppress_duplicate_track_documents([weak, strong], config)
+
+    assert strong["status"] == "pending"
+    assert weak["status"] == "duplicate_skipped"
+    assert weak["duplicate_of"] == "track-strong"
+    assert report["suppressed_count"] == 1
+    assert report["suppressions"][0]["evidence"]["shared_scan_fraction"] == 1.0
+
+
+def test_duplicate_track_detection_preserves_distinct_support_and_prompts():
+    base = _duplicate_track(
+        "track-base",
+        [make_observation("a1", 1, 0.0), make_observation("a2", 2, 0.0)],
+    )
+    disjoint = _duplicate_track(
+        "track-disjoint",
+        [make_observation("b1", 1, 2.0), make_observation("b2", 2, 2.0)],
+    )
+    other_prompt = _duplicate_track(
+        "track-bus",
+        [make_observation("c1", 1, 0.0), make_observation("c2", 2, 0.0)],
+        prompt="bus",
+    )
+    low_overlap = _duplicate_track(
+        "track-late",
+        [make_observation("d1", 2, 0.0), make_observation("d2", 3, 0.0)],
+    )
+
+    assert duplicate_track_evidence(base, disjoint) is None
+    assert duplicate_track_evidence(base, other_prompt) is None
+    assert duplicate_track_evidence(base, low_overlap, min_shared_fraction=0.75) is None
+
+
+def test_duplicate_track_default_rejects_marginal_aabb_containment():
+    first = _duplicate_track(
+        "track-first",
+        [make_observation("a1", 1, 0.0), make_observation("a2", 2, 0.0)],
+    )
+    second = _duplicate_track(
+        "track-second",
+        [make_observation("b1", 1, 0.38), make_observation("b2", 2, 0.38)],
+    )
+    for observation in first["observations"]:
+        observation["bbox_min_world"] = [0.0, 0.0, 0.0]
+        observation["bbox_max_world"] = [1.0, 1.0, 1.0]
+    for observation in second["observations"]:
+        observation["bbox_min_world"] = [0.78, 0.0, 0.0]
+        observation["bbox_max_world"] = [1.78, 1.0, 1.0]
+
+    assert duplicate_track_evidence(first, second) is None
+    marginal = duplicate_track_evidence(first, second, min_containment=0.20)
+    assert marginal is not None
+    assert marginal["median_aabb_containment"] == pytest.approx(0.22)
+
+
+def test_duplicate_track_suppression_can_be_disabled():
+    first = _duplicate_track(
+        "track-a",
+        [make_observation("a1", 1, 0.0), make_observation("a2", 2, 0.0)],
+    )
+    second = _duplicate_track(
+        "track-b",
+        [make_observation("b1", 1, 0.1), make_observation("b2", 2, 0.1)],
+        primary=False,
+    )
+    config = SegmentConfig(
+        prompts=("car",), sam3_model_dir="model", suppress_duplicate_tracks=False
+    )
+
+    report = suppress_duplicate_track_documents([first, second], config)
+
+    assert report["suppressed_count"] == 0
+    assert [first["status"], second["status"]] == ["pending", "pending"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("duplicate_track_max_centroid_m", 0.0),
+        ("duplicate_track_min_shared_fraction", 0.0),
+        ("duplicate_track_min_containment", 1.1),
+    ],
+)
+def test_duplicate_track_thresholds_are_validated(field, value):
+    with pytest.raises(ValueError, match=field):
+        SegmentConfig(prompts=("car",), sam3_model_dir="model", **{field: value})
 
 
 def test_mesh_range_is_inclusive():

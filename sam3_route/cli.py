@@ -9,6 +9,7 @@ from typing import Optional, Sequence
 
 from .extract import ExtractConfig, extract_route
 from .reconstruct import ReconstructConfig, reconstruct_route
+from .scene import SceneConfig, compose_scene
 from .surface import (
     SurfaceSegmentConfig,
     TinConfig,
@@ -113,6 +114,21 @@ def _add_segment_options(
     parser.add_argument("--min-range-points", type=int, default=10)
     parser.add_argument("--dynamic-min-speed-mps", type=float, default=0.5)
     _add_mesh_range_options(parser)
+    _add_duplicate_track_options(parser)
+
+
+def _add_duplicate_track_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--suppress-duplicate-tracks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Suppress coincident same-prompt LiDAR tracks before SAM 3D.",
+    )
+    parser.add_argument("--duplicate-track-max-centroid-m", type=float, default=1.0)
+    parser.add_argument(
+        "--duplicate-track-min-shared-fraction", type=float, default=0.50
+    )
+    parser.add_argument("--duplicate-track-min-containment", type=float, default=0.30)
 
 
 def _add_mesh_range_options(parser: argparse.ArgumentParser) -> None:
@@ -211,6 +227,19 @@ def _add_reconstruct_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fit-max-up-tilt-deg", type=float, default=20.0)
 
 
+def _add_scene_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--suppress-overlapping-meshes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Suppress lower-quality overlapping same-prompt meshes in scene.glb.",
+    )
+    parser.add_argument("--mesh-overlap-min-iou", type=float, default=0.35)
+    parser.add_argument("--mesh-overlap-min-containment", type=float, default=0.75)
+    parser.add_argument("--mesh-vertical-overlap-min", type=float, default=0.50)
+    parser.add_argument("--mesh-overlap-resolution-m", type=float, default=0.10)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sam3d-ouster-route",
@@ -240,6 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     track.add_argument("--min-range-points", type=int)
     track.add_argument("--dynamic-min-speed-mps", type=float, default=0.5)
     _add_mesh_range_options(track)
+    _add_duplicate_track_options(track)
     track.add_argument("--overwrite", action="store_true")
 
     reconstruct = subparsers.add_parser(
@@ -247,13 +277,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconstruct.add_argument("run_dir", type=Path)
     _add_reconstruct_options(reconstruct)
+    _add_scene_options(reconstruct)
     reconstruct.add_argument("--overwrite", action="store_true")
 
     run = subparsers.add_parser("run", help="Run all stages with resumable artifacts.")
     _add_extract_options(run, include_source=True)
     _add_segment_options(run, require_prompt=True)
     _add_reconstruct_options(run)
+    _add_scene_options(run)
     run.add_argument("--overwrite", action="store_true")
+
+    scene = subparsers.add_parser(
+        "scene", help="Compose positioned object GLBs without running SAM 3D."
+    )
+    scene_commands = scene.add_subparsers(dest="scene_command", required=True)
+    scene_build = scene_commands.add_parser(
+        "build", help="Rebuild scene.glb from existing individual object GLBs."
+    )
+    scene_build.add_argument("run_dir", type=Path)
+    _add_scene_options(scene_build)
+    scene_build.add_argument("--overwrite", action="store_true")
 
     surface = subparsers.add_parser(
         "surface",
@@ -313,6 +356,10 @@ def _segment_config(args: argparse.Namespace) -> SegmentConfig:
         min_range_points=args.min_range_points,
         dynamic_min_speed_mps=args.dynamic_min_speed_mps,
         max_mesh_range_m=args.max_mesh_range_m,
+        suppress_duplicate_tracks=args.suppress_duplicate_tracks,
+        duplicate_track_max_centroid_m=args.duplicate_track_max_centroid_m,
+        duplicate_track_min_shared_fraction=args.duplicate_track_min_shared_fraction,
+        duplicate_track_min_containment=args.duplicate_track_min_containment,
     )
 
 
@@ -354,6 +401,16 @@ def _surface_segment_config(args: argparse.Namespace) -> SurfaceSegmentConfig:
     )
 
 
+def _scene_config(args: argparse.Namespace) -> SceneConfig:
+    return SceneConfig(
+        suppress_overlapping_meshes=args.suppress_overlapping_meshes,
+        mesh_overlap_min_iou=args.mesh_overlap_min_iou,
+        mesh_overlap_min_containment=args.mesh_overlap_min_containment,
+        mesh_vertical_overlap_min=args.mesh_vertical_overlap_min,
+        mesh_overlap_resolution_m=args.mesh_overlap_resolution_m,
+    )
+
+
 def _tin_config(args: argparse.Namespace) -> TinConfig:
     return TinConfig(
         surface_resolution_m=args.surface_resolution_m,
@@ -367,6 +424,14 @@ def _tin_config(args: argparse.Namespace) -> TinConfig:
 
 
 def run_cli(args: argparse.Namespace) -> int:
+    if args.command == "scene":
+        if args.scene_command == "build":
+            scene = compose_scene(
+                args.run_dir, _scene_config(args), overwrite=args.overwrite
+            )
+            print(f"Wrote positioned mesh scene: {scene}")
+            return 0
+        raise AssertionError(f"unsupported scene command {args.scene_command}")
     if args.command == "surface":
         if args.surface_command == "segment":
             path = segment_surface_route(
@@ -421,6 +486,10 @@ def run_cli(args: argparse.Namespace) -> int:
             min_range_points=args.min_range_points,
             dynamic_min_speed_mps=args.dynamic_min_speed_mps,
             max_mesh_range_m=args.max_mesh_range_m,
+            suppress_duplicate_tracks=args.suppress_duplicate_tracks,
+            duplicate_track_max_centroid_m=args.duplicate_track_max_centroid_m,
+            duplicate_track_min_shared_fraction=args.duplicate_track_min_shared_fraction,
+            duplicate_track_min_containment=args.duplicate_track_min_containment,
             overwrite=args.overwrite,
         )
         print(f"Rebuilt route tracks without model inference: {path}")
@@ -430,6 +499,7 @@ def run_cli(args: argparse.Namespace) -> int:
             args.run_dir,
             _reconstruct_config(args),
             overwrite=args.overwrite,
+            scene_config=_scene_config(args),
         )
         print(f"Wrote positioned mesh scene: {scene}")
         return 1 if failures else 0
@@ -450,6 +520,7 @@ def run_cli(args: argparse.Namespace) -> int:
             args.output_dir,
             _reconstruct_config(args),
             overwrite=args.overwrite,
+            scene_config=_scene_config(args),
         )
         print(f"Wrote positioned mesh scene: {scene}")
         return 1 if failures else 0
