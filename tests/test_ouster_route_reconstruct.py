@@ -265,6 +265,43 @@ def test_reconstruct_skips_unconfirmed_tracks(tmp_path):
     assert [value["track_id"] for value in scene["meshes"]] == ["track-000001"]
 
 
+def test_reconstruct_skips_tracks_marked_as_duplicates(tmp_path):
+    run_dir, cube = make_route_run(tmp_path)
+    document = json.loads((run_dir / "tracks.json").read_text())
+    duplicate = json.loads(json.dumps(document["tracks"][0]))
+    duplicate["id"] = "track-000002"
+    duplicate["status"] = "duplicate_skipped"
+    duplicate["duplicate_of"] = "track-000001"
+    document["tracks"].append(duplicate)
+    atomic_write_json(run_dir / "tracks.json", document)
+    calls = []
+
+    class FakeInference:
+        def __init__(self, config, **kwargs):
+            calls.append("init")
+
+        def __call__(self, image, mask, **kwargs):
+            calls.append("infer")
+            return {
+                "glb": cube.copy(),
+                "rotation": np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+                "translation": np.asarray([[0.0, 0.0, 5.0]]),
+                "scale": np.asarray([[1.0, 1.0, 1.0]]),
+            }
+
+    reconstruct_route(
+        run_dir,
+        ReconstructConfig(sam3d_config=str(tmp_path / "pipeline.yaml")),
+        inference_factory=FakeInference,
+        image_loader=lambda path: np.asarray(Image.open(path).convert("RGB")),
+    )
+
+    assert calls == ["init", "infer"]
+    tracks = json.loads((run_dir / "tracks.json").read_text())["tracks"]
+    assert tracks[1]["status"] == "duplicate_skipped"
+    assert tracks[1]["mesh"] is None
+
+
 def test_reconstruct_skips_confirmed_static_track_outside_range(tmp_path):
     run_dir, _ = make_route_run(tmp_path)
     document = json.loads((run_dir / "tracks.json").read_text())

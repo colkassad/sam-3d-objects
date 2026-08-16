@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import shutil
-import struct
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -37,6 +36,7 @@ from .lidar_fit import (
     select_diverse_views,
     world_rays_from_frame,
 )
+from .scene import SceneConfig, compose_scene
 
 
 @dataclass(frozen=True)
@@ -373,39 +373,11 @@ def _export_positioned_glb(mesh: Any, transform: np.ndarray, path: Path, node_na
     scene.export(path, file_type="glb")
 
 
-def _write_empty_glb(path: Path) -> None:
-    document = json.dumps(
-        {
-            "asset": {"version": "2.0", "generator": "sam3d-ouster-route"},
-            "scene": 0,
-            "scenes": [{"nodes": []}],
-            "nodes": [],
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
-    document += b" " * ((4 - len(document) % 4) % 4)
-    total_length = 12 + 8 + len(document)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as stream:
-        stream.write(struct.pack("<4sII", b"glTF", 2, total_length))
-        stream.write(struct.pack("<I4s", len(document), b"JSON"))
-        stream.write(document)
-
-
-def _load_positioned_geometry(mesh_path: Path) -> tuple[Any, np.ndarray]:
-    import trimesh
-
-    scene = trimesh.load(mesh_path, force="scene")
-    nodes = list(scene.graph.nodes_geometry)
-    if len(nodes) != 1:
-        raise ValueError(f"positioned GLB must contain one mesh node: {mesh_path}")
-    transform, geometry_name = scene.graph[nodes[0]]
-    return scene.geometry[geometry_name].copy(), np.asarray(transform)
-
-
 def _reconstruction_eligible(track: dict[str, Any]) -> bool:
     """Only confirmed-static, in-range tracks reach SAM3D."""
 
+    if track.get("status") == "duplicate_skipped" or track.get("duplicate_of"):
+        return False
     motion_state = track.get("motion_state")
     if motion_state is None:
         return not bool(track.get("dynamic"))
@@ -495,6 +467,7 @@ def reconstruct_route(
     config: ReconstructConfig,
     *,
     overwrite: bool = False,
+    scene_config: Optional[SceneConfig] = None,
     inference_factory: Optional[Callable[..., Any]] = None,
     image_loader: Optional[Callable[[Path], Any]] = None,
 ) -> tuple[Path, int]:
@@ -505,6 +478,7 @@ def reconstruct_route(
         raise RuntimeError("segment stage must complete before reconstruction")
     tracks_path = artifact_path(run_dir, manifest["tracks"])
     tracks_document = read_tracks(tracks_path)
+    resolved_scene_config = scene_config or SceneConfig()
     unfinished = [
         track
         for track in tracks_document["tracks"]
@@ -515,7 +489,18 @@ def reconstruct_route(
         and not overwrite
         and not unfinished
     ):
-        return artifact_path(run_dir, manifest["outputs"]["scene_glb"]), 0
+        # Legacy runs may have a complete reconstruction but no independent
+        # scene-composition stage. Adopt them by composing once from their
+        # existing individual GLBs; current runs remain fully resumable.
+        scene_overwrite = "scene_compose" not in manifest.get("stages", {})
+        return (
+            compose_scene(
+                run_dir,
+                resolved_scene_config,
+                overwrite=scene_overwrite,
+            ),
+            0,
+        )
     current = manifest.get("stages", {}).get("reconstruct")
     if (
         current
@@ -533,6 +518,13 @@ def reconstruct_route(
             if _reconstruction_eligible(track):
                 track["status"] = "pending"
                 track["mesh"] = None
+    # Any reconstruction work invalidates the aggregate immediately. This
+    # prevents an interrupted resume from leaving a physically stale scene.
+    (run_dir / "scene.glb").unlink(missing_ok=True)
+    (run_dir / "scene.json").unlink(missing_ok=True)
+    manifest.get("stages", {}).pop("scene_compose", None)
+    manifest.setdefault("outputs", {}).pop("scene_glb", None)
+    manifest["outputs"].pop("scene_json", None)
     update_stage(manifest, "reconstruct", config.manifest_value(), status="running")
     atomic_write_json(manifest_path, manifest)
 
@@ -653,69 +645,11 @@ def reconstruct_route(
                 }
             atomic_write_json(tracks_path, tracks_document)
 
-        import trimesh
-
-        scene = trimesh.Scene()
-        scene_records = []
-        for track in tracks_document["tracks"]:
-            mesh_record = track.get("mesh") or {}
-            if (
-                not _reconstruction_eligible(track)
-                or track.get("status") != "ok"
-                or not mesh_record.get("path")
-            ):
-                continue
-            mesh_path = artifact_path(run_dir, mesh_record["path"])
-            mesh, transform = _load_positioned_geometry(mesh_path)
-            scene.add_geometry(
-                mesh,
-                node_name=track["id"],
-                geom_name=track["id"],
-                transform=transform,
-            )
-            selected = _prediction_for_track(track)
-            scene_records.append(
-                {
-                    "track_id": track["id"],
-                    "prompt": track["prompt"],
-                    "mesh": mesh_record["path"],
-                    "world_from_glb": mesh_record["world_from_glb"],
-                    "source_rgb": track["best_rgb"],
-                    "source_mask": track["best_mask"],
-                    "sam3d_crop": track.get("sam3d_crop"),
-                    "sam3_score": selected["score"],
-                    "dimensions_m": selected["extents_world"],
-                    "median_range_m": selected["median_range_m"],
-                    "centroid_world": track.get("reconstruction_centroid_world")
-                    or track["centroid_world"],
-                    "track_centroid_world": track["centroid_world"],
-                    "range_gate": track.get("range_gate"),
-                    "fit": mesh_record["fit"],
-                }
-            )
-        scene_glb = run_dir / "scene.glb"
-        if scene_records:
-            scene.export(scene_glb, file_type="glb")
-        else:
-            _write_empty_glb(scene_glb)
-        scene_json = run_dir / "scene.json"
-        atomic_write_json(
-            scene_json,
-            {
-                "schema": "ouster-mesh-scene/v1",
-                "coordinate_system": manifest["coordinate_system"],
-                "meshes": scene_records,
-                "point_cloud": manifest.get("outputs", {}).get("point_cloud"),
-            },
-        )
-        manifest["outputs"]["scene_glb"] = relative_artifact(run_dir, scene_glb)
-        manifest["outputs"]["scene_json"] = relative_artifact(run_dir, scene_json)
         manifest.setdefault("software", {}).update(
             software_versions(
                 {
                     "sam3d_objects": "sam-3d-objects",
                     "torch": "torch",
-                    "trimesh": "trimesh",
                     "open3d": "open3d",
                 }
             )
@@ -723,7 +657,6 @@ def reconstruct_route(
         update_stage(manifest, "reconstruct", config.manifest_value(), status="complete")
         atomic_write_json(tracks_path, tracks_document)
         atomic_write_json(manifest_path, manifest)
-        return scene_glb, failures
     except Exception as exc:
         update_stage(
             manifest,
@@ -735,3 +668,5 @@ def reconstruct_route(
         atomic_write_json(manifest_path, manifest)
         atomic_write_json(tracks_path, tracks_document)
         raise
+    scene_glb = compose_scene(run_dir, resolved_scene_config, overwrite=True)
+    return scene_glb, failures

@@ -72,6 +72,17 @@ contribute to association and motion classification, but they cannot supply
 SAM 3D imagery or metric fitting points. Change the limit with
 `--max-mesh-range-m`; use `--no-max-mesh-range` to disable it.
 
+Coincident same-prompt LiDAR tracks are suppressed before reconstruction by
+default. A pair must be within 1 metre, share at least half of the smaller
+track's frames, and have at least 30% median same-frame 3D AABB containment.
+The track with stronger primary-depth, inlier, valid-depth, observation, and
+SAM evidence is retained. The losing track remains in `tracks.json` with
+`status: duplicate_skipped`, `duplicate_of`, and comparison diagnostics. Tune
+this with `--duplicate-track-max-centroid-m`,
+`--duplicate-track-min-shared-fraction`, and
+`--duplicate-track-min-containment`, or disable it with
+`--no-suppress-duplicate-tracks`.
+
 Position fitting is grounded by default. SAM 3D's PyTorch3D row-vector pose is
 converted to the GLB/world column-vector convention, GLB local Y is checked
 against SLAM world-up, and elongated meshes are aligned to the robust
@@ -105,6 +116,24 @@ python scripts/ouster_prompt_to_scene.py segment outputs/route \
 
 python scripts/ouster_prompt_to_scene.py reconstruct outputs/route
 ```
+
+Scene composition is an independent, model-free stage. Rebuild only the
+aggregate scene after changing overlap thresholds with:
+
+```bash
+sam3d-ouster-route scene build outputs/route --overwrite
+```
+
+By default, same-prompt meshes conflict when their rasterized world-XY convex
+footprints have at least 0.35 IoU and 0.75 smaller-footprint containment, with
+at least 0.50 vertical overlap. Duplicate LiDAR support also creates a scene
+conflict even if a bad final pose displaced the meshes apart. The stronger
+LiDAR/ray-fit candidate remains in `scene.glb`; suppressed individual GLBs are
+kept for inspection and `scene.json` records the winner, loser, reason,
+metrics, and quality summaries. Use `--no-suppress-overlapping-meshes` to keep
+all successful meshes, or tune `--mesh-overlap-min-iou`,
+`--mesh-overlap-min-containment`, `--mesh-vertical-overlap-min`, and
+`--mesh-overlap-resolution-m`.
 
 After changing tracking code or motion thresholds, rebuild range hypotheses
 and tracks from the existing SAM 3 masks without loading SAM 3 again:
@@ -160,6 +189,10 @@ scan indices remain absolute positions in the source recording.
 If a track has insufficient coherent range pixels, is dynamic, unconfirmed, or
 outside the mesh range, or fails SAM 3D reconstruction, its reason remains in
 `tracks.json`; other tracks continue processing.
+
+Scene-level suppression does not change track status or delete the losing
+`meshes/<track-id>.glb`. Inspect `scene.json.suppressed_meshes` to distinguish
+duplicate-support suppression from final world-mesh overlap suppression.
 
 ## Prompted route surfaces as a TIN
 

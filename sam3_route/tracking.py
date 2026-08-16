@@ -27,6 +27,11 @@ from .artifacts import (
 from .geometry import points_from_range, transform_pointmap_per_column
 
 
+DEFAULT_DUPLICATE_TRACK_MAX_CENTROID_M = 1.0
+DEFAULT_DUPLICATE_TRACK_MIN_SHARED_FRACTION = 0.50
+DEFAULT_DUPLICATE_TRACK_MIN_CONTAINMENT = 0.30
+
+
 @dataclass(frozen=True)
 class SegmentConfig:
     prompts: tuple[str, ...]
@@ -39,6 +44,12 @@ class SegmentConfig:
     min_range_points: int = 10
     dynamic_min_speed_mps: float = 0.5
     max_mesh_range_m: Optional[float] = 30.0
+    suppress_duplicate_tracks: bool = True
+    duplicate_track_max_centroid_m: float = DEFAULT_DUPLICATE_TRACK_MAX_CENTROID_M
+    duplicate_track_min_shared_fraction: float = (
+        DEFAULT_DUPLICATE_TRACK_MIN_SHARED_FRACTION
+    )
+    duplicate_track_min_containment: float = DEFAULT_DUPLICATE_TRACK_MIN_CONTAINMENT
 
     def __post_init__(self) -> None:
         if not self.prompts or any(not value.strip() for value in self.prompts):
@@ -51,6 +62,20 @@ class SegmentConfig:
             not math.isfinite(self.max_mesh_range_m) or self.max_mesh_range_m <= 0
         ):
             raise ValueError("max_mesh_range_m must be finite and greater than zero")
+        if (
+            not math.isfinite(self.duplicate_track_max_centroid_m)
+            or self.duplicate_track_max_centroid_m <= 0
+        ):
+            raise ValueError(
+                "duplicate_track_max_centroid_m must be finite and greater than zero"
+            )
+        for name in (
+            "duplicate_track_min_shared_fraction",
+            "duplicate_track_min_containment",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or not 0 < value <= 1:
+                raise ValueError(f"{name} must be finite and in (0, 1]")
         if not 0.0 <= self.score_threshold <= 1.0:
             raise ValueError("score_threshold must be between 0 and 1")
         if not 0.0 <= self.mask_threshold <= 1.0:
@@ -723,6 +748,172 @@ def _track_status(motion_state: str, has_range_eligible_observation: bool) -> st
     raise ValueError(f"unsupported motion state {motion_state!r}")
 
 
+def track_evidence_summary(track: dict[str, Any]) -> dict[str, Any]:
+    """Return deterministic LiDAR evidence used to rank duplicate tracks."""
+
+    observations = list(track.get("observations") or [])
+    if not observations:
+        return {
+            "primary_component_fraction": 0.0,
+            "median_inlier_fraction": 0.0,
+            "median_valid_depth_fraction": 0.0,
+            "observation_count": 0,
+            "median_sam_score": 0.0,
+        }
+    return {
+        "primary_component_fraction": float(
+            np.mean(
+                [int(value.get("depth_candidate_rank", 0)) == 0 for value in observations]
+            )
+        ),
+        "median_inlier_fraction": float(
+            np.median([float(value.get("inlier_fraction", 0.0)) for value in observations])
+        ),
+        "median_valid_depth_fraction": float(
+            np.median(
+                [float(value.get("valid_depth_fraction", 0.0)) for value in observations]
+            )
+        ),
+        "observation_count": len(observations),
+        "median_sam_score": float(
+            np.median([float(value.get("score", 0.0)) for value in observations])
+        ),
+    }
+
+
+def _track_evidence_sort_key(track: dict[str, Any]) -> tuple[Any, ...]:
+    summary = track_evidence_summary(track)
+    return (
+        -summary["primary_component_fraction"],
+        -summary["median_inlier_fraction"],
+        -summary["median_valid_depth_fraction"],
+        -summary["observation_count"],
+        -summary["median_sam_score"],
+        str(track.get("id", "")),
+    )
+
+
+def duplicate_track_evidence(
+    first: dict[str, Any],
+    second: dict[str, Any],
+    *,
+    max_centroid_m: float = DEFAULT_DUPLICATE_TRACK_MAX_CENTROID_M,
+    min_shared_fraction: float = DEFAULT_DUPLICATE_TRACK_MIN_SHARED_FRACTION,
+    min_containment: float = DEFAULT_DUPLICATE_TRACK_MIN_CONTAINMENT,
+) -> Optional[dict[str, Any]]:
+    """Describe coincident same-prompt track support, or return ``None``."""
+
+    if str(first.get("prompt", "")).casefold() != str(
+        second.get("prompt", "")
+    ).casefold():
+        return None
+    first_observations = list(first.get("observations") or [])
+    second_observations = list(second.get("observations") or [])
+    if not first_observations or not second_observations:
+        return None
+    centroid_distance = float(
+        np.linalg.norm(
+            np.asarray(first["centroid_world"], dtype=np.float64)
+            - np.asarray(second["centroid_world"], dtype=np.float64)
+        )
+    )
+    if centroid_distance > max_centroid_m:
+        return None
+    first_by_scan = {int(value["scan_index"]): value for value in first_observations}
+    second_by_scan = {int(value["scan_index"]): value for value in second_observations}
+    shared_scans = sorted(set(first_by_scan).intersection(second_by_scan))
+    shared_fraction = len(shared_scans) / max(
+        min(len(first_by_scan), len(second_by_scan)), 1
+    )
+    if shared_fraction < min_shared_fraction:
+        return None
+    containments: list[float] = []
+    for scan_index in shared_scans:
+        first_value = first_by_scan[scan_index]
+        second_value = second_by_scan[scan_index]
+        first_low = np.asarray(first_value["bbox_min_world"], dtype=np.float64)
+        first_high = np.asarray(first_value["bbox_max_world"], dtype=np.float64)
+        second_low = np.asarray(second_value["bbox_min_world"], dtype=np.float64)
+        second_high = np.asarray(second_value["bbox_max_world"], dtype=np.float64)
+        overlap = np.maximum(
+            0.0, np.minimum(first_high, second_high) - np.maximum(first_low, second_low)
+        )
+        intersection = float(np.prod(overlap))
+        first_volume = float(np.prod(np.maximum(first_high - first_low, 1e-9)))
+        second_volume = float(np.prod(np.maximum(second_high - second_low, 1e-9)))
+        containments.append(intersection / max(min(first_volume, second_volume), 1e-9))
+    median_containment = float(np.median(containments)) if containments else 0.0
+    if median_containment < min_containment:
+        return None
+    return {
+        "centroid_distance_m": centroid_distance,
+        "shared_scan_count": len(shared_scans),
+        "shared_scan_fraction": float(shared_fraction),
+        "median_aabb_containment": median_containment,
+    }
+
+
+def _track_is_reconstruction_candidate(track: dict[str, Any]) -> bool:
+    if track.get("motion_state") != "confirmed_static":
+        return False
+    range_gate = track.get("range_gate")
+    return range_gate is None or bool(range_gate.get("eligible", True))
+
+
+def suppress_duplicate_track_documents(
+    tracks: Sequence[dict[str, Any]], config: SegmentConfig
+) -> dict[str, Any]:
+    """Mark lower-evidence coincident tracks before SAM 3D reconstruction."""
+
+    candidates = [track for track in tracks if _track_is_reconstruction_candidate(track)]
+    report: dict[str, Any] = {
+        "enabled": config.suppress_duplicate_tracks,
+        "config": {
+            "max_centroid_m": config.duplicate_track_max_centroid_m,
+            "min_shared_fraction": config.duplicate_track_min_shared_fraction,
+            "min_containment": config.duplicate_track_min_containment,
+        },
+        "candidate_count": len(candidates),
+        "kept_count": len(candidates),
+        "suppressed_count": 0,
+        "suppressions": [],
+    }
+    if not config.suppress_duplicate_tracks:
+        return report
+    kept: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=_track_evidence_sort_key):
+        duplicate_of: Optional[dict[str, Any]] = None
+        evidence: Optional[dict[str, Any]] = None
+        for prior in kept:
+            evidence = duplicate_track_evidence(
+                candidate,
+                prior,
+                max_centroid_m=config.duplicate_track_max_centroid_m,
+                min_shared_fraction=config.duplicate_track_min_shared_fraction,
+                min_containment=config.duplicate_track_min_containment,
+            )
+            if evidence is not None:
+                duplicate_of = prior
+                break
+        if duplicate_of is None:
+            kept.append(candidate)
+            continue
+        candidate["status"] = "duplicate_skipped"
+        candidate["duplicate_of"] = duplicate_of["id"]
+        candidate["duplicate_evidence"] = evidence
+        record = {
+            "track_id": candidate["id"],
+            "duplicate_of": duplicate_of["id"],
+            "evidence": evidence,
+            "winner_quality": track_evidence_summary(duplicate_of),
+            "loser_quality": track_evidence_summary(candidate),
+        }
+        report["suppressions"].append(record)
+    report["suppressed_count"] = len(report["suppressions"])
+    report["kept_count"] = len(candidates) - report["suppressed_count"]
+    return report
+
+
 def _track_document(
     run_dir: Path,
     track_id: str,
@@ -838,6 +1029,7 @@ def build_tracks(
         )
         for index, values in enumerate(raw_tracks, start=1)
     ]
+    duplicate_suppression = suppress_duplicate_track_documents(documents, config)
     output = run_dir / "tracks.json"
     atomic_write_json(
         output,
@@ -845,6 +1037,7 @@ def build_tracks(
             "schema": TRACKS_SCHEMA,
             "tracks": documents,
             "rejected_observations": rejected,
+            "duplicate_suppression": duplicate_suppression,
         },
     )
     return output
@@ -856,6 +1049,12 @@ def retrack_route(
     min_range_points: Optional[int] = None,
     dynamic_min_speed_mps: float = 0.5,
     max_mesh_range_m: Optional[float] = 30.0,
+    suppress_duplicate_tracks: bool = True,
+    duplicate_track_max_centroid_m: float = DEFAULT_DUPLICATE_TRACK_MAX_CENTROID_M,
+    duplicate_track_min_shared_fraction: float = (
+        DEFAULT_DUPLICATE_TRACK_MIN_SHARED_FRACTION
+    ),
+    duplicate_track_min_containment: float = DEFAULT_DUPLICATE_TRACK_MIN_CONTAINMENT,
     overwrite: bool = False,
 ) -> Path:
     """Rebuild geometry/tracks from saved SAM masks without loading either model."""
@@ -874,6 +1073,12 @@ def retrack_route(
     values["prompts"] = tuple(values["prompts"])
     values["dynamic_min_speed_mps"] = dynamic_min_speed_mps
     values["max_mesh_range_m"] = max_mesh_range_m
+    values["suppress_duplicate_tracks"] = suppress_duplicate_tracks
+    values["duplicate_track_max_centroid_m"] = duplicate_track_max_centroid_m
+    values["duplicate_track_min_shared_fraction"] = (
+        duplicate_track_min_shared_fraction
+    )
+    values["duplicate_track_min_containment"] = duplicate_track_min_containment
     if min_range_points is not None:
         values["min_range_points"] = min_range_points
     config = SegmentConfig(**values)
@@ -889,6 +1094,7 @@ def retrack_route(
     manifest["tracks"] = relative_artifact(run_dir, tracks_path)
     manifest["prompts"] = list(config.prompts)
     manifest.get("stages", {}).pop("reconstruct", None)
+    manifest.get("stages", {}).pop("scene_compose", None)
     manifest.setdefault("outputs", {}).pop("scene_glb", None)
     manifest.setdefault("outputs", {}).pop("scene_json", None)
     update_stage(manifest, "segment", config.manifest_value(), status="complete")
@@ -927,6 +1133,7 @@ def segment_route(
             path.unlink()
     manifest["tracks"] = None
     manifest.get("stages", {}).pop("reconstruct", None)
+    manifest.get("stages", {}).pop("scene_compose", None)
     manifest["outputs"].pop("scene_glb", None)
     manifest["outputs"].pop("scene_json", None)
     update_stage(manifest, "segment", config.manifest_value(), status="running")
