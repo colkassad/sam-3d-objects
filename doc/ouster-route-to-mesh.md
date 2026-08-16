@@ -160,3 +160,79 @@ scan indices remain absolute positions in the source recording.
 If a track has insufficient coherent range pixels, is dynamic, unconfirmed, or
 outside the mesh range, or fails SAM 3D reconstruction, its reason remains in
 `tracks.json`; other tracks continue processing.
+
+## Prompted route surfaces as a TIN
+
+Roads and other large, approximately 2.5D surfaces should not be passed to SAM
+3D's bounded-object reconstruction. The surface workflow uses SAM 3 only to
+identify registered range pixels, fuses those metric LiDAR returns, and builds
+an open triangulated irregular network directly in the local SLAM frame.
+
+Run the complete workflow with one or more literal surface descriptions:
+
+```bash
+sam3d-ouster-route surface run /data/route.osf \
+  --output-dir outputs/road-surface \
+  --prompt "dirt road" \
+  --prompt "gravel carriageway"
+```
+
+Surface runs select a keyframe every 1 metre by default. The usual extraction
+options, including OSF frame windows and `--meta` for PCAP recordings, remain
+available. All predictions from all supplied prompts are unioned into one
+surface; no prompt word or synonym is special-cased.
+
+The workflow is also staged so SAM 3 does not need to run again while tuning
+the TIN:
+
+```bash
+sam3d-ouster-route extract /data/route.osf \
+  --output-dir outputs/road-surface \
+  --keyframe-distance-m 1
+
+sam3d-ouster-route surface segment outputs/road-surface \
+  --prompt "unpaved track" \
+  --prompt "gravel road"
+
+sam3d-ouster-route surface build outputs/road-surface \
+  --surface-resolution-m 0.20 \
+  --max-surface-range-m 30 \
+  --max-triangle-edge-m 1.0 \
+  --max-slope-deg 45 \
+  --tin-tile-size-m 50
+```
+
+Use `--no-max-surface-range` to retain all valid masked ranges. Reducing
+`--surface-resolution-m` retains more detail but increases point count,
+triangulation memory, and GLB size. The triangulation is tiled and uses local
+point spacing, a hard edge limit, slope filtering, and centroid/edge-midpoint
+support checks. It deliberately leaves unsupported gaps open instead of
+filling them or extending triangles past the observed shoulders.
+
+Surface-owned artifacts do not replace object masks, tracks, or scenes:
+
+- `frames/<frame-id>/surface-segmentation/` contains the original SAM 3 masks;
+- `surface/surface-points.ply` is the fused binary RGB point cloud used as the
+  TIN vertex set;
+- `surface/surface.glb` is one vertex-colored open mesh, including any
+  disconnected supported components;
+- `surface/surface.json` records prompts, configuration, bounds, frame and
+  point counts, rejected-face reasons, and component areas.
+
+Coordinates remain in metres in the recording window's local, non-georeferenced
+SLAM frame. A TIN has one elevation per XY location, so overlapping decks such
+as stacked roads or an overpass above another selected surface are not
+supported in a single output.
+
+For a quality check, view the PLY and GLB together and verify that the fused
+points stop at the observed shoulders, face normals point upward, and no faces
+span medians, intersections, or unobserved gaps. An opt-in end-to-end smoke test
+is available when a small OSF fixture and the masking executable are present:
+
+```bash
+RUN_SAM3_SURFACE_INTEGRATION=1 \
+SAM3_ROUTE_OSF_FIXTURE=/data/route.osf \
+SAM3_MASK_ROUTE_EXECUTABLE=/home/ubuntu/micromamba/envs/sam3-masking/bin/sam3-mask-route \
+SAM3_SURFACE_TEST_PROMPT="gravel road" \
+pytest -m gpu tests/test_ouster_route_surface.py -s
+```

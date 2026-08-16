@@ -5,9 +5,7 @@ from sam3_route.cli import build_parser
 
 def test_route_parser_exposes_stages_and_aggressive_mesh_defaults():
     parser = build_parser()
-    extract = parser.parse_args(
-        ["extract", "route.osf", "--output-dir", "output"]
-    )
+    extract = parser.parse_args(["extract", "route.osf", "--output-dir", "output"])
     extract_window = parser.parse_args(
         [
             "extract",
@@ -46,6 +44,21 @@ def test_route_parser_exposes_stages_and_aggressive_mesh_defaults():
         ["track", "output", "--max-mesh-range-m", "12.5", "--overwrite"]
     )
     reconstruct = parser.parse_args(["reconstruct", "output"])
+    surface_run = parser.parse_args(
+        [
+            "surface",
+            "run",
+            "route.osf",
+            "--output-dir",
+            "surface-output",
+            "--prompt",
+            "dirt track",
+        ]
+    )
+    surface_segment = parser.parse_args(
+        ["surface", "segment", "surface-output", "--prompt", "gravel carriageway"]
+    )
+    surface_build = parser.parse_args(["surface", "build", "surface-output"])
 
     assert extract.keyframe_distance_m == 5.0
     assert extract.keyframe_angle_deg == 5.0
@@ -75,6 +88,15 @@ def test_route_parser_exposes_stages_and_aggressive_mesh_defaults():
     assert reconstruct.fit_grounded is True
     assert reconstruct.fit_align_long_axis is True
     assert reconstruct.fit_max_up_tilt_deg == 20.0
+    assert surface_run.surface_command == "run"
+    assert surface_run.keyframe_distance_m == 1.0
+    assert surface_run.prompt == ["dirt track"]
+    assert surface_run.surface_resolution_m == 0.20
+    assert surface_run.max_surface_range_m == 30.0
+    assert surface_segment.prompt == ["gravel carriageway"]
+    assert surface_build.max_triangle_edge_m == 1.0
+    assert surface_build.max_slope_deg == 45.0
+    assert surface_build.tin_tile_size_m == 50.0
 
     disabled = parser.parse_args(["reconstruct", "output", "--fit-mode", "none"])
     assert disabled.fit_mode == "none"

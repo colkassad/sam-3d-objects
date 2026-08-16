@@ -147,6 +147,24 @@ and metric SAM 3D mesh placement. See the
 [Ouster route-to-mesh guide](doc/ouster-route-to-mesh.md) for environment setup,
 staged commands, defaults, coordinate conventions, and outputs.
 
+Large route surfaces such as asphalt, dirt, or gravel roads can instead be
+reconstructed directly from SAM 3-selected LiDAR returns. This bypasses SAM 3D,
+fuses the selected points into a dedicated RGB point cloud, and exports a
+conservatively clipped triangulated irregular network (TIN):
+
+```bash
+sam3d-ouster-route surface run /data/route.osf \
+  --output-dir outputs/road-surface \
+  --prompt "dirt road" \
+  --prompt "gravel road"
+```
+
+Every supplied phrase is treated as a surface description and unioned into one
+`surface/surface-points.ply` and `surface/surface.glb`; the implementation does
+not hardcode or classify prompt text. See the
+[surface TIN section](doc/ouster-route-to-mesh.md#prompted-route-surfaces-as-a-tin)
+for staged use and mesh controls.
+
 
 ## SAM 3D Body
 

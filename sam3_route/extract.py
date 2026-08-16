@@ -276,6 +276,7 @@ def _save_keyframe(run_dir: Path, snapshot: ScanSnapshot) -> dict[str, Any]:
         "rgb": relative_artifact(run_dir, rgb_path),
         "geometry": relative_artifact(run_dir, geometry_path),
         "mask_manifest": None,
+        "surface_mask_manifest": None,
     }
 
 
@@ -321,6 +322,7 @@ def _initial_manifest(source: Path, metadata: Optional[Path]) -> dict[str, Any]:
         "trajectory": None,
         "keyframes": [],
         "prompts": [],
+        "surface_prompts": [],
         "tracks": None,
         "source_window": None,
         "outputs": {},
@@ -329,7 +331,7 @@ def _initial_manifest(source: Path, metadata: Optional[Path]) -> dict[str, Any]:
 
 
 def _clean_extract_outputs(run_dir: Path, manifest: dict[str, Any]) -> None:
-    for name in ("frames", "observations", "tracks", "meshes"):
+    for name in ("frames", "observations", "tracks", "meshes", "surface"):
         directory = run_dir / name
         if directory.exists():
             shutil.rmtree(directory)
@@ -421,6 +423,9 @@ def extract_route(
         manifest["source_window"] = None
         manifest.get("stages", {}).pop("segment", None)
         manifest.get("stages", {}).pop("reconstruct", None)
+        manifest.get("stages", {}).pop("surface_segment", None)
+        manifest.get("stages", {}).pop("surface_tin", None)
+        manifest["surface_prompts"] = []
         manifest["outputs"] = {}
 
     update_stage(manifest, "extract", config.manifest_value(), status="running")

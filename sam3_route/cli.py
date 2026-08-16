@@ -9,6 +9,13 @@ from typing import Optional, Sequence
 
 from .extract import ExtractConfig, extract_route
 from .reconstruct import ReconstructConfig, reconstruct_route
+from .surface import (
+    SurfaceSegmentConfig,
+    TinConfig,
+    build_surface_tin,
+    generate_surface_route,
+    segment_surface_route,
+)
 from .tracking import SegmentConfig, retrack_route, segment_route
 
 
@@ -27,7 +34,12 @@ def discover_batch_executable(explicit: Optional[str]) -> Path:
     ]
     executable_name = "sam3-mask-route.exe" if os.name == "nt" else "sam3-mask-route"
     executable_dir = "Scripts" if os.name == "nt" else "bin"
-    sibling = Path(sys.prefix).resolve().parent / "sam3-masking" / executable_dir / executable_name
+    sibling = (
+        Path(sys.prefix).resolve().parent
+        / "sam3-masking"
+        / executable_dir
+        / executable_name
+    )
     candidates.append(("sibling sam3-masking environment", str(sibling)))
     candidates.append(("PATH", shutil.which("sam3-mask-route")))
     for _, value in candidates:
@@ -48,7 +60,9 @@ def discover_batch_executable(explicit: Optional[str]) -> Path:
     )
 
 
-def _add_extract_options(parser: argparse.ArgumentParser, *, include_source: bool) -> None:
+def _add_extract_options(
+    parser: argparse.ArgumentParser, *, include_source: bool
+) -> None:
     if include_source:
         parser.add_argument("source", type=Path)
         parser.add_argument("--output-dir", type=Path, required=True)
@@ -77,11 +91,18 @@ def _add_extract_options(parser: argparse.ArgumentParser, *, include_source: boo
     )
 
 
-def _add_segment_options(parser: argparse.ArgumentParser, *, require_prompt: bool) -> None:
+def _add_segment_options(
+    parser: argparse.ArgumentParser, *, require_prompt: bool
+) -> None:
     parser.add_argument(
-        "--prompt", action="append", required=require_prompt, help="Repeat for each object concept."
+        "--prompt",
+        action="append",
+        required=require_prompt,
+        help="Repeat for each object concept.",
     )
-    parser.add_argument("--sam3-model-dir", type=Path, default=Path("checkpoints/sam3-hf"))
+    parser.add_argument(
+        "--sam3-model-dir", type=Path, default=Path("checkpoints/sam3-hf")
+    )
     parser.add_argument("--sam3-executable")
     parser.add_argument("--sam3-device", default="auto")
     parser.add_argument(
@@ -111,6 +132,43 @@ def _add_mesh_range_options(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(max_mesh_range_m=30.0)
 
 
+def _add_surface_segment_options(
+    parser: argparse.ArgumentParser, *, require_prompt: bool
+) -> None:
+    parser.add_argument(
+        "--prompt",
+        action="append",
+        required=require_prompt,
+        help="Repeat for every text description of the target surface.",
+    )
+    parser.add_argument(
+        "--sam3-model-dir", type=Path, default=Path("checkpoints/sam3-hf")
+    )
+    parser.add_argument("--sam3-executable")
+    parser.add_argument("--sam3-device", default="auto")
+    parser.add_argument(
+        "--sam3-dtype", choices=("auto", "bf16", "fp16", "fp32"), default="auto"
+    )
+    parser.add_argument("--score-threshold", type=float, default=0.5)
+    parser.add_argument("--mask-threshold", type=float, default=0.5)
+
+
+def _add_tin_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--surface-resolution-m", type=float, default=0.20)
+    range_group = parser.add_mutually_exclusive_group()
+    range_group.add_argument("--max-surface-range-m", type=float)
+    range_group.add_argument(
+        "--no-max-surface-range",
+        action="store_const",
+        const=None,
+        dest="max_surface_range_m",
+    )
+    parser.set_defaults(max_surface_range_m=30.0)
+    parser.add_argument("--max-triangle-edge-m", type=float, default=1.0)
+    parser.add_argument("--max-slope-deg", type=float, default=45.0)
+    parser.add_argument("--tin-tile-size-m", type=float, default=50.0)
+
+
 def _add_reconstruct_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--sam3d-config", type=Path, default=Path("checkpoints/hf/pipeline.yaml")
@@ -126,9 +184,7 @@ def _add_reconstruct_options(parser: argparse.ArgumentParser) -> None:
         "--memory-profile", choices=("auto", "low_vram", "resident"), default="low_vram"
     )
     parser.add_argument("--compile", action="store_true", dest="compile_model")
-    parser.add_argument(
-        "--fit-mode", choices=("raycast", "none"), default="raycast"
-    )
+    parser.add_argument("--fit-mode", choices=("raycast", "none"), default="raycast")
     parser.add_argument("--fit-max-axis-scale-change", type=float, default=0.25)
     parser.add_argument("--fit-max-rays-per-view", type=int, default=2_000)
     parser.add_argument("--fit-max-views", type=int, default=5)
@@ -146,15 +202,21 @@ def _add_reconstruct_options(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sam3d-ouster-route",
-        description="Extract, segment, track, and reconstruct Ouster route objects.",
+        description=(
+            "Extract, segment, and reconstruct Ouster route objects and surfaces."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    extract = subparsers.add_parser("extract", help="Run SLAM and export motion-selected keyframes.")
+    extract = subparsers.add_parser(
+        "extract", help="Run SLAM and export motion-selected keyframes."
+    )
     _add_extract_options(extract, include_source=True)
     extract.add_argument("--overwrite", action="store_true")
 
-    segment = subparsers.add_parser("segment", help="Run batch SAM3 and associate observations.")
+    segment = subparsers.add_parser(
+        "segment", help="Run batch SAM3 and associate observations."
+    )
     segment.add_argument("run_dir", type=Path)
     _add_segment_options(segment, require_prompt=True)
     segment.add_argument("--overwrite", action="store_true")
@@ -180,6 +242,34 @@ def build_parser() -> argparse.ArgumentParser:
     _add_segment_options(run, require_prompt=True)
     _add_reconstruct_options(run)
     run.add_argument("--overwrite", action="store_true")
+
+    surface = subparsers.add_parser(
+        "surface",
+        help="Segment and triangulate a large prompted route surface without SAM 3D.",
+    )
+    surface_commands = surface.add_subparsers(dest="surface_command", required=True)
+    surface_run = surface_commands.add_parser(
+        "run", help="Extract, segment, and build a surface TIN."
+    )
+    _add_extract_options(surface_run, include_source=True)
+    surface_run.set_defaults(keyframe_distance_m=1.0)
+    _add_surface_segment_options(surface_run, require_prompt=True)
+    _add_tin_options(surface_run)
+    surface_run.add_argument("--overwrite", action="store_true")
+
+    surface_segment = surface_commands.add_parser(
+        "segment", help="Run SAM 3 into independent surface mask artifacts."
+    )
+    surface_segment.add_argument("run_dir", type=Path)
+    _add_surface_segment_options(surface_segment, require_prompt=True)
+    surface_segment.add_argument("--overwrite", action="store_true")
+
+    surface_build = surface_commands.add_parser(
+        "build", help="Build a point cloud and TIN from saved surface masks."
+    )
+    surface_build.add_argument("run_dir", type=Path)
+    _add_tin_options(surface_build)
+    surface_build.add_argument("--overwrite", action="store_true")
     return parser
 
 
@@ -239,7 +329,60 @@ def _reconstruct_config(args: argparse.Namespace) -> ReconstructConfig:
     )
 
 
+def _surface_segment_config(args: argparse.Namespace) -> SurfaceSegmentConfig:
+    executable = discover_batch_executable(args.sam3_executable)
+    return SurfaceSegmentConfig(
+        prompts=tuple(value.strip() for value in args.prompt),
+        sam3_model_dir=str(_resolve_repo_path(args.sam3_model_dir)),
+        sam3_executable=str(executable),
+        sam3_device=args.sam3_device,
+        sam3_dtype=args.sam3_dtype,
+        score_threshold=args.score_threshold,
+        mask_threshold=args.mask_threshold,
+    )
+
+
+def _tin_config(args: argparse.Namespace) -> TinConfig:
+    return TinConfig(
+        surface_resolution_m=args.surface_resolution_m,
+        max_surface_range_m=args.max_surface_range_m,
+        max_triangle_edge_m=args.max_triangle_edge_m,
+        max_slope_deg=args.max_slope_deg,
+        tin_tile_size_m=args.tin_tile_size_m,
+    )
+
+
 def run_cli(args: argparse.Namespace) -> int:
+    if args.command == "surface":
+        if args.surface_command == "segment":
+            path = segment_surface_route(
+                args.run_dir,
+                _surface_segment_config(args),
+                overwrite=args.overwrite,
+            )
+            print(f"Wrote surface mask artifacts: {path}")
+            return 0
+        if args.surface_command == "build":
+            outputs = build_surface_tin(
+                args.run_dir, _tin_config(args), overwrite=args.overwrite
+            )
+            print(f"Wrote surface TIN: {outputs.mesh}")
+            print(f"Wrote surface point cloud: {outputs.point_cloud}")
+            return 0
+        if args.surface_command == "run":
+            outputs = generate_surface_route(
+                args.source,
+                args.output_dir,
+                metadata=args.meta,
+                extract_config=_extract_config(args),
+                segment_config=_surface_segment_config(args),
+                tin_config=_tin_config(args),
+                overwrite=args.overwrite,
+            )
+            print(f"Wrote surface TIN: {outputs.mesh}")
+            print(f"Wrote surface point cloud: {outputs.point_cloud}")
+            return 0
+        raise AssertionError(f"unsupported surface command {args.surface_command}")
     if args.command == "extract":
         path = extract_route(
             args.source,
