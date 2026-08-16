@@ -17,6 +17,12 @@ from .artifacts import (
 )
 
 
+_ARTIFACT_SETS = {
+    "objects": ("segmentation", "mask_manifest", "prompts"),
+    "surface": ("surface-segmentation", "surface_mask_manifest", "surface_prompts"),
+}
+
+
 def batch_segment_route(
     run_dir: Path,
     *,
@@ -27,6 +33,7 @@ def batch_segment_route(
     device: str = "auto",
     dtype: str = "auto",
     overwrite: bool = False,
+    artifact_set: str = "objects",
     generator_factory: Callable[..., Any] = Sam3MaskGenerator.from_pretrained,
 ) -> int:
     run_dir = run_dir.expanduser().resolve()
@@ -35,14 +42,18 @@ def batch_segment_route(
     normalized_prompts = tuple(value.strip() for value in prompts if value.strip())
     if not normalized_prompts:
         raise ValueError("at least one nonempty prompt is required")
+    try:
+        output_name, manifest_field, prompts_field = _ARTIFACT_SETS[artifact_set]
+    except KeyError as exc:
+        raise ValueError(f"unsupported artifact set {artifact_set!r}") from exc
     count = 0
     with generator_factory(model_dir, device=device, dtype=dtype) as generator:
         for frame in manifest["keyframes"]:
             image_path = artifact_path(run_dir, frame["rgb"])
-            output_dir = run_dir / "frames" / frame["id"] / "segmentation"
+            output_dir = run_dir / "frames" / frame["id"] / output_name
             output_manifest = output_dir / "manifest.json"
             if output_manifest.exists() and not overwrite:
-                frame["mask_manifest"] = relative_artifact(run_dir, output_manifest)
+                frame[manifest_field] = relative_artifact(run_dir, output_manifest)
                 continue
             if output_dir.exists() and overwrite:
                 shutil.rmtree(output_dir)
@@ -56,9 +67,9 @@ def batch_segment_route(
             output_manifest = write_mask_manifest(
                 result, output_dir, image_path=image_path
             )
-            frame["mask_manifest"] = relative_artifact(run_dir, output_manifest)
+            frame[manifest_field] = relative_artifact(run_dir, output_manifest)
             count += len(result.predictions)
-    manifest["prompts"] = list(normalized_prompts)
+    manifest[prompts_field] = list(normalized_prompts)
     manifest.setdefault("software", {}).update(
         software_versions(
             {
@@ -85,6 +96,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dtype", choices=("auto", "bf16", "fp16", "fp32"), default="auto"
     )
+    parser.add_argument(
+        "--artifact-set", choices=tuple(_ARTIFACT_SETS), default="objects"
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -100,6 +114,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         device=args.device,
         dtype=args.dtype,
         overwrite=args.overwrite,
+        artifact_set=args.artifact_set,
     )
     print(f"Wrote {count} new SAM 3 route observation(s).")
     return 0
