@@ -19,12 +19,14 @@ dynamic = ["dependencies", "optional-dependencies"]
 ignore-vcs = true
 include = ["**/*.py"]
 exclude = ["conftest.py", "*_test.py"]
-packages = ["sam3d_objects", "sam3_masking"]
+packages = ["sam3d_objects", "sam3_masking", "sam3_route"]
 
 [project.scripts]
 sam3-prepare = "sam3_masking.cli_prepare:main"
 sam3-mask = "sam3_masking.cli_mask:main"
 sam3d-prompt-to-mesh = "sam3_masking.mesh_bridge:main"
+sam3-mask-route = "sam3_route.batch_segment:main"
+sam3d-ouster-route = "sam3_route.cli:main"
 
 [tool.hatch.metadata.hooks.requirements_txt]
 files = ["requirements.txt"]
@@ -34,6 +36,7 @@ p3d = ["requirements.p3d.txt"]
 inference = ["requirements.inference.txt"]
 dev = ["requirements.dev.txt"]
 sam3 = ["requirements.sam3.txt"]
+ouster = ["requirements.ouster.txt"]
 
 [tool.pytest.ini_options]
 markers = [

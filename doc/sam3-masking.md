@@ -143,12 +143,12 @@ The segmentation manifest is augmented with an `ok` or `failed` mesh record for
 each instance. Failures do not prevent remaining objects from being attempted,
 but the command exits nonzero if any mesh failed.
 
-## Future Ouster ingestion
+## Ouster route ingestion
 
-OSF/PCAP decoding is intentionally outside this integration. A route reader can
-later assign the Ouster frame/timestamp to `source_id`, perform segmentation or
-tracking as a first pass, terminate SAM 3, and reconstruct selected manifest
-instances as a second pass. This preserves the 16 GB GPU lifecycle boundary.
+The staged PCAP/OSF route workflow now assigns Ouster frame/timestamp IDs,
+runs KISS SLAM over every scan, terminates the persistent SAM 3 batch before
+loading SAM 3D, and reconstructs one selected observation per static object
+track. See [the Ouster route-to-mesh guide](ouster-route-to-mesh.md).
 
 ## Optional GPU smoke test
 

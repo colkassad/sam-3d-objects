@@ -139,7 +139,13 @@ a dedicated process so it releases a 16 GB GPU before SAM 3D loads.
 
 See [the SAM 3 masking and prompt-to-mesh guide](doc/sam3-masking.md) for setup,
 offline model preparation using `/mnt/d/Data/models/sam3.safetensors`, Python
-usage, and the three new command-line tools.
+usage, and the prompt-to-mesh command-line tools.
+
+Recorded Ouster PCAP/OSF routes can be processed with KISS SLAM, motion-based
+keyframe selection, persistent batch SAM 3, cross-frame object association,
+and metric SAM 3D mesh placement. See the
+[Ouster route-to-mesh guide](doc/ouster-route-to-mesh.md) for environment setup,
+staged commands, defaults, coordinate conventions, and outputs.
 
 
 ## SAM 3D Body
