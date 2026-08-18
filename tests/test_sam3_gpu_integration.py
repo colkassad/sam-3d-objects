@@ -22,7 +22,7 @@ def test_real_sam3_masks_feed_sam3d_mesh_generation(tmp_path):
         [
             "--image",
             str(image),
-            "--prompt",
+            "--prompts",
             os.environ.get("SAM3_TEST_PROMPT", "box"),
             "--output-dir",
             str(tmp_path),

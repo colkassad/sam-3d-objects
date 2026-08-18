@@ -85,7 +85,9 @@ def test_surface_segmentation_preserves_prompts_and_object_artifacts(tmp_path):
     segment_surface_route(run_dir, config, subprocess_run=fake_run)
 
     assert len(commands) == 1
-    assert commands[0].count("--prompt") == 2
+    assert commands[0][commands[0].index("--prompts") + 1] == (
+        "dirt track,gravel carriageway"
+    )
     assert commands[0][commands[0].index("--artifact-set") + 1] == "surface"
     document = json.loads(manifest_path.read_text())
     assert document["surface_prompts"] == ["dirt track", "gravel carriageway"]
@@ -564,7 +566,7 @@ def test_real_ouster_surface_masks_feed_tin_generation(tmp_path):
             os.environ.get("SAM3_SURFACE_MAX_SCANS", "5"),
             "--keyframe-distance-m",
             "0.1",
-            "--prompt",
+            "--prompts",
             os.environ.get("SAM3_SURFACE_TEST_PROMPT", "drivable surface"),
             "--sam3-executable",
             executable,

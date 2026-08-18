@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -18,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 from sam3_masking.artifacts import prompt_slug, read_manifest_document  # noqa: E402
 from sam3_masking.mesh_bridge import build_parser as build_bridge_parser  # noqa: E402
 from sam3_masking.mesh_bridge import run as run_bridge  # noqa: E402
+from sam3_masking.prompts import parse_prompt_catalog  # noqa: E402
 
 
 def _resolve_executable(value: str, *, source: str) -> Path:
@@ -82,15 +82,16 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Segment an arbitrary image with SAM 3 text prompts, release SAM 3, "
             "and generate one SAM 3D GLB per detected instance."
-        )
+        ),
+        allow_abbrev=False,
     )
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument(
-        "--prompt",
-        action="append",
+        "--prompts",
         required=True,
-        help="Text concept prompt; repeat for multiple prompts.",
+        help="Comma-separated text concept prompts.",
     )
+    parser.add_argument("--synonyms", default="")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--sam3-executable")
     parser.add_argument(
@@ -123,10 +124,8 @@ def _validate_inputs(args: argparse.Namespace) -> tuple[Path, Path, Path, Path, 
     image_path = args.image.expanduser().resolve()
     if not image_path.is_file():
         raise FileNotFoundError(f"source image does not exist: {image_path}")
-    prompts = [prompt.strip() for prompt in args.prompt]
-    if any(not prompt for prompt in prompts):
-        raise ValueError("prompts must not be empty")
-    args.prompt = prompts
+    catalog = parse_prompt_catalog(args.prompts, args.synonyms)
+    args.prompts = ",".join(catalog.prompts)
 
     model_dir = _resolve_repo_path(args.sam3_model_dir)
     if not model_dir.is_dir() or not (model_dir / "model.safetensors").is_file():
@@ -181,8 +180,9 @@ def _bridge_arguments(
         "--repo-root",
         str(REPO_ROOT),
     ]
-    for prompt in args.prompt:
-        argv.extend(("--prompt", prompt))
+    argv.extend(("--prompts", args.prompts))
+    if args.synonyms.strip():
+        argv.extend(("--synonyms", args.synonyms))
     optional_values = (
         ("--mesh-target-faces", args.mesh_target_faces),
         ("--stage1-inference-steps", args.stage1_inference_steps),

@@ -155,8 +155,7 @@ conservatively clipped triangulated irregular network (TIN):
 ```bash
 sam3d-ouster-route surface run /data/route.osf \
   --output-dir outputs/road-surface \
-  --prompt "dirt road" \
-  --prompt "gravel road"
+  --prompts "dirt road,gravel road"
 ```
 
 Every supplied phrase is treated as a surface description and unioned into one

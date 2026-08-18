@@ -60,6 +60,7 @@ def write_mask_manifest(
             {
                 "id": prediction.id,
                 "prompt": prediction.prompt,
+                "query_prompt": prediction.query_prompt,
                 "score": prediction.score,
                 "box_xyxy": list(prediction.box_xyxy),
                 "mask": mask_path.relative_to(output_dir).as_posix(),
@@ -127,6 +128,7 @@ def load_mask_manifest(path: Union[str, Path]) -> MaskFrame:
             MaskPrediction(
                 id=str(record["id"]),
                 prompt=str(record["prompt"]),
+                query_prompt=str(record.get("query_prompt", record["prompt"])),
                 score=float(record["score"]),
                 box_xyxy=tuple(float(value) for value in record["box_xyxy"]),
                 mask=np.asarray(mask, dtype=np.bool_),

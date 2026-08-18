@@ -31,13 +31,11 @@ from .tracking import (
     track_evidence_summary,
 )
 
-
 SCENE_SCHEMA = "ouster-mesh-scene/v1"
 
 
 @dataclass(frozen=True)
 class SceneConfig:
-    suppress_overlapping_meshes: bool = True
     mesh_overlap_min_iou: float = 0.35
     mesh_overlap_min_containment: float = 0.75
     mesh_vertical_overlap_min: float = 0.50
@@ -125,7 +123,7 @@ def _convex_footprint(vertices: np.ndarray) -> np.ndarray:
 def _inside_convex_polygon(samples: np.ndarray, polygon: np.ndarray) -> np.ndarray:
     result = np.ones(samples.shape[:-1], dtype=bool)
     epsilon = 1e-10
-    for first, second in zip(polygon, np.roll(polygon, -1, axis=0)):
+    for first, second in zip(polygon, np.roll(polygon, -1, axis=0), strict=False):
         edge = second - first
         cross = edge[0] * (samples[..., 1] - first[1]) - edge[1] * (
             samples[..., 0] - first[0]
@@ -211,9 +209,7 @@ def _scene_quality(track: dict[str, Any]) -> dict[str, Any]:
     return {
         "final_ray_objective": None if math.isinf(score_value) else score_value,
         "reliable_view_count": len(views),
-        "median_depth_residual_m": (
-            float(np.median(residuals)) if residuals else None
-        ),
+        "median_depth_residual_m": (float(np.median(residuals)) if residuals else None),
         **track_quality,
     }
 
@@ -239,6 +235,7 @@ def _scene_record(track: dict[str, Any]) -> dict[str, Any]:
     return {
         "track_id": track["id"],
         "prompt": track["prompt"],
+        "query_prompt": selected.get("query_prompt", track["prompt"]),
         "mesh": mesh_record["path"],
         "world_from_glb": mesh_record["world_from_glb"],
         "source_rgb": track["best_rgb"],
@@ -314,7 +311,7 @@ def compose_scene(
     *,
     overwrite: bool = False,
 ) -> Path:
-    """Compose positioned object GLBs with conservative overlap suppression."""
+    """Compose every successful GLB and report, but do not suppress, conflicts."""
 
     import trimesh
 
@@ -341,7 +338,9 @@ def compose_scene(
     ):
         raise RuntimeError("scene configuration changed; pass --overwrite")
     if not current and artifacts_exist and not overwrite:
-        raise RuntimeError("scene artifacts already exist; pass --overwrite to replace them")
+        raise RuntimeError(
+            "scene artifacts already exist; pass --overwrite to replace them"
+        )
     scene_glb.unlink(missing_ok=True)
     scene_json.unlink(missing_ok=True)
     manifest.setdefault("outputs", {}).pop("scene_glb", None)
@@ -380,61 +379,58 @@ def compose_scene(
                 )
             )
 
-        kept: list[_SceneCandidate] = []
-        suppressed: list[dict[str, Any]] = []
+        mesh_conflicts: list[dict[str, Any]] = []
         duplicate_thresholds = _duplicate_thresholds(tracks_document)
-        for candidate in sorted(candidates, key=_scene_quality_sort_key):
-            suppression: Optional[dict[str, Any]] = None
-            if config.suppress_overlapping_meshes:
-                for winner in kept:
-                    if candidate.track["prompt"].casefold() != winner.track[
-                        "prompt"
-                    ].casefold():
-                        continue
-                    support = duplicate_track_evidence(
-                        candidate.track,
-                        winner.track,
-                        **duplicate_thresholds,
-                    )
-                    overlap = _mesh_overlap_metrics(
-                        candidate,
-                        winner,
-                        resolution_m=config.mesh_overlap_resolution_m,
-                    )
-                    mesh_conflict = (
-                        (
-                            overlap["footprint_iou"] >= config.mesh_overlap_min_iou
-                            or overlap["footprint_containment"]
-                            >= config.mesh_overlap_min_containment
-                        )
-                        and overlap["vertical_containment"]
-                        >= config.mesh_vertical_overlap_min
-                    )
-                    reasons = []
-                    if support is not None:
-                        reasons.append("duplicate_track_support")
-                    if mesh_conflict:
-                        reasons.append("world_mesh_overlap")
-                    if reasons:
-                        suppression = {
-                            "track_id": candidate.track["id"],
-                            "loser_track_id": candidate.track["id"],
-                            "winner_track_id": winner.track["id"],
-                            "reasons": reasons,
-                            "track_support": support,
-                            "mesh_overlap": overlap,
-                            "winner_quality": winner.quality,
-                            "loser_quality": candidate.quality,
-                        }
-                        break
-            if suppression is None:
-                kept.append(candidate)
-            else:
-                suppressed.append(suppression)
+        ordered_candidates = sorted(candidates, key=lambda value: value.track["id"])
+        for first_index, first in enumerate(ordered_candidates):
+            for second in ordered_candidates[first_index + 1 :]:
+                if (
+                    first.track["prompt"].casefold()
+                    != second.track["prompt"].casefold()
+                ):
+                    continue
+                overlap = _mesh_overlap_metrics(
+                    first,
+                    second,
+                    resolution_m=config.mesh_overlap_resolution_m,
+                )
+                mesh_conflict = (
+                    overlap["footprint_iou"] >= config.mesh_overlap_min_iou
+                    or overlap["footprint_containment"]
+                    >= config.mesh_overlap_min_containment
+                ) and overlap[
+                    "vertical_containment"
+                ] >= config.mesh_vertical_overlap_min
+                if not mesh_conflict:
+                    continue
+                first_centroid = np.asarray(
+                    first.track["centroid_world"], dtype=np.float64
+                )
+                second_centroid = np.asarray(
+                    second.track["centroid_world"], dtype=np.float64
+                )
+                mesh_conflicts.append(
+                    {
+                        "first_track_id": first.track["id"],
+                        "second_track_id": second.track["id"],
+                        "prompt": first.track["prompt"],
+                        "track_centroid_distance_m": float(
+                            np.linalg.norm(first_centroid - second_centroid)
+                        ),
+                        "duplicate_track_evidence": duplicate_track_evidence(
+                            first.track,
+                            second.track,
+                            **duplicate_thresholds,
+                        ),
+                        "mesh_overlap": overlap,
+                        "first_quality": first.quality,
+                        "second_quality": second.quality,
+                    }
+                )
 
         scene = trimesh.Scene()
         records: list[dict[str, Any]] = []
-        for candidate in sorted(kept, key=lambda value: value.track["id"]):
+        for candidate in ordered_candidates:
             scene.add_geometry(
                 candidate.mesh,
                 node_name=candidate.track["id"],
@@ -449,20 +445,16 @@ def compose_scene(
                 "schema": SCENE_SCHEMA,
                 "coordinate_system": manifest["coordinate_system"],
                 "meshes": records,
-                "suppressed_meshes": suppressed,
+                "suppressed_meshes": [],
+                "mesh_conflicts": mesh_conflicts,
                 "composition": {
                     "config": config.manifest_value(),
                     "input_mesh_count": len(candidates),
                     "kept_mesh_count": len(records),
-                    "suppressed_mesh_count": len(suppressed),
-                    "duplicate_support_suppressed_count": sum(
-                        "duplicate_track_support" in value["reasons"]
-                        for value in suppressed
-                    ),
-                    "mesh_overlap_suppressed_count": sum(
-                        "world_mesh_overlap" in value["reasons"]
-                        for value in suppressed
-                    ),
+                    "suppressed_mesh_count": 0,
+                    "duplicate_support_suppressed_count": 0,
+                    "mesh_overlap_suppressed_count": 0,
+                    "mesh_conflict_count": len(mesh_conflicts),
                 },
                 "point_cloud": manifest.get("outputs", {}).get("point_cloud"),
             },

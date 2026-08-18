@@ -4,7 +4,7 @@ import json
 import math
 import shutil
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
@@ -13,6 +13,7 @@ from PIL import Image
 from scipy.optimize import linear_sum_assignment
 
 from sam3_masking.artifacts import load_mask_manifest, read_manifest_document
+from sam3_masking.prompts import build_prompt_catalog
 
 from .artifacts import (
     TRACKS_SCHEMA,
@@ -20,12 +21,12 @@ from .artifacts import (
     atomic_write_json,
     config_digest,
     read_route_manifest,
+    read_tracks,
     relative_artifact,
     stage_is_current,
     update_stage,
 )
 from .geometry import points_from_range, transform_pointmap_per_column
-
 
 DEFAULT_DUPLICATE_TRACK_MAX_CENTROID_M = 1.0
 DEFAULT_DUPLICATE_TRACK_MIN_SHARED_FRACTION = 0.50
@@ -37,6 +38,7 @@ MIN_RECONSTRUCTION_INLIER_FRACTION = 0.20
 class SegmentConfig:
     prompts: tuple[str, ...]
     sam3_model_dir: str
+    synonyms: str = ""
     sam3_executable: str = "sam3-mask-route"
     sam3_device: str = "auto"
     sam3_dtype: str = "auto"
@@ -51,10 +53,11 @@ class SegmentConfig:
         DEFAULT_DUPLICATE_TRACK_MIN_SHARED_FRACTION
     )
     duplicate_track_min_containment: float = DEFAULT_DUPLICATE_TRACK_MIN_CONTAINMENT
+    adaptive_sam3_recovery: bool = True
+    sam3_recovery_rounds: int = 2
 
     def __post_init__(self) -> None:
-        if not self.prompts or any(not value.strip() for value in self.prompts):
-            raise ValueError("at least one nonempty prompt is required")
+        build_prompt_catalog(self.prompts, self.synonyms)
         if self.min_range_points < 3:
             raise ValueError("min_range_points must be at least 3")
         if self.dynamic_min_speed_mps <= 0:
@@ -83,6 +86,8 @@ class SegmentConfig:
             raise ValueError("mask_threshold must be between 0 and 1")
         if self.sam3_dtype not in {"auto", "bf16", "fp16", "fp32"}:
             raise ValueError("unsupported SAM3 dtype")
+        if self.sam3_recovery_rounds < 0:
+            raise ValueError("sam3_recovery_rounds must be non-negative")
 
     def manifest_value(self) -> dict[str, Any]:
         value = asdict(self)
@@ -114,9 +119,18 @@ class Observation:
     bbox_min_world: list[float]
     bbox_max_world: list[float]
     extents_world: list[float]
+    depth_point_count: int = 0
     quality: float = 0.0
     depth_candidate_rank: int = 0
     depth_candidate_count: int = 1
+    query_prompt: Optional[str] = None
+    vertical_border_touch: bool = False
+    vertical_edge_clearance: float = 0.0
+    quality_components: dict[str, float] = field(default_factory=dict)
+    selection_rank: Optional[int] = None
+    evidence_class: Optional[str] = None
+    in_evidence_consensus: bool = False
+    reconstruction_eligible: bool = False
 
     @property
     def centroid(self) -> np.ndarray:
@@ -194,7 +208,7 @@ def _depth_components(
     candidate_pairs: list[tuple[int, int, float]] = []
     spacings: list[float] = []
 
-    for row_offset, col_offset in ((1, 0), (0, 1)):
+    for row_offset, _col_offset in ((1, 0), (0, 1)):
         if row_offset:
             pairs = valid[:-1] & valid[1:]
             rows, cols = np.nonzero(pairs)
@@ -203,8 +217,12 @@ def _depth_components(
             pairs = valid & np.roll(valid, -1, axis=1)
             rows, cols = np.nonzero(pairs)
             next_rows, next_cols = rows, (cols + 1) % width
-        for row, col, next_row, next_col in zip(rows, cols, next_rows, next_cols):
-            distance = float(np.linalg.norm(points[row, col] - points[next_row, next_col]))
+        for row, col, next_row, next_col in zip(
+            rows, cols, next_rows, next_cols, strict=False
+        ):
+            distance = float(
+                np.linalg.norm(points[row, col] - points[next_row, next_col])
+            )
             if math.isfinite(distance) and distance > 0:
                 spacings.append(distance)
                 candidate_pairs.append(
@@ -274,16 +292,25 @@ def _observations_from_prediction(
         return []
     mask_manifest = artifact_path(run_dir, frame["mask_manifest"])
     document = read_manifest_document(mask_manifest)
-    record = next(item for item in document["predictions"] if item["id"] == prediction.id)
+    record = next(
+        item for item in document["predictions"] if item["id"] == prediction.id
+    )
     mask_path = (mask_manifest.parent / record["mask"]).resolve()
     mask_area = int(np.count_nonzero(prediction.mask))
-    valid_depth = int(np.count_nonzero(prediction.mask & np.all(np.isfinite(points_world), axis=-1)))
-    border = bool(
-        np.any(prediction.mask[:2])
-        or np.any(prediction.mask[-2:])
-        or np.any(prediction.mask[:, :2])
-        or np.any(prediction.mask[:, -2:])
+    valid_depth = int(
+        np.count_nonzero(prediction.mask & np.all(np.isfinite(points_world), axis=-1))
     )
+    border = bool(np.any(prediction.mask[:2]) or np.any(prediction.mask[-2:]))
+    mask_rows = np.nonzero(prediction.mask)[0]
+    vertical_clearance = 0.0
+    if len(mask_rows):
+        clearance_px = min(
+            int(mask_rows.min()),
+            int(prediction.mask.shape[0] - 1 - mask_rows.max()),
+        )
+        vertical_clearance = float(
+            np.clip(clearance_px / max(0.10 * prediction.mask.shape[0], 1.0), 0.0, 1.0)
+        )
     observations: list[Observation] = []
     for rank, component in enumerate(components):
         clean_mask = component.mask
@@ -314,6 +341,7 @@ def _observations_from_prediction(
                 timestamp_ns=frame.get("timestamp_ns"),
                 prediction_id=prediction.id,
                 prompt=prediction.prompt.strip(),
+                query_prompt=(prediction.query_prompt or prediction.prompt).strip(),
                 score=float(prediction.score),
                 mask_path=relative_artifact(run_dir, mask_path),
                 cleaned_mask_path=relative_artifact(run_dir, cleaned_mask_path),
@@ -322,7 +350,10 @@ def _observations_from_prediction(
                 image_area_px=int(prediction.mask.size),
                 valid_depth_fraction=float(valid_depth / max(mask_area, 1)),
                 inlier_fraction=float(len(selected_world) / max(valid_depth, 1)),
+                depth_point_count=int(len(selected_world)),
                 border_touch=border,
+                vertical_border_touch=border,
+                vertical_edge_clearance=vertical_clearance,
                 median_range_m=float(np.median(sensor_norm)),
                 azimuth_rad=_circular_mean(azimuths),
                 elevation_rad=float(np.median(elevations)),
@@ -354,9 +385,10 @@ def collect_observations(
         sensor_to_body_matrix = calibration["sensor_to_body"]
     candidate_groups: list[list[Observation]] = []
     rejected: list[dict[str, Any]] = []
-    for frame in manifest["keyframes"]:
+    frames = list(manifest["keyframes"]) + list(manifest.get("recovery_frames", []))
+    for frame in frames:
         if not frame.get("mask_manifest"):
-            raise RuntimeError(f"keyframe {frame['id']} has no SAM3 mask manifest")
+            continue
         with np.load(artifact_path(run_dir, frame["geometry"])) as geometry:
             range_mm = geometry["range_mm"]
             poses = geometry["body_to_world"]
@@ -392,12 +424,16 @@ def collect_observations(
     return observations, rejected
 
 
-def _aabb_iou(first: Observation, second: Observation, expansion: float = 0.75) -> float:
+def _aabb_iou(
+    first: Observation, second: Observation, expansion: float = 0.75
+) -> float:
     first_low = np.asarray(first.bbox_min_world) - expansion
     first_high = np.asarray(first.bbox_max_world) + expansion
     second_low = np.asarray(second.bbox_min_world) - expansion
     second_high = np.asarray(second.bbox_max_world) + expansion
-    overlap = np.maximum(0.0, np.minimum(first_high, second_high) - np.maximum(first_low, second_low))
+    overlap = np.maximum(
+        0.0, np.minimum(first_high, second_high) - np.maximum(first_low, second_low)
+    )
     intersection = float(np.prod(overlap))
     first_volume = float(np.prod(np.maximum(first_high - first_low, 1e-6)))
     second_volume = float(np.prod(np.maximum(second_high - second_low, 1e-6)))
@@ -411,7 +447,9 @@ def _track_centroid(track: list[Observation]) -> np.ndarray:
 def _association_cost(track: list[Observation], observation: Observation) -> float:
     previous = track[-1]
     distance = float(np.linalg.norm(_track_centroid(track) - observation.centroid))
-    first_diagonal = float(np.linalg.norm(np.median([item.extents for item in track], axis=0)))
+    first_diagonal = float(
+        np.linalg.norm(np.median([item.extents for item in track], axis=0))
+    )
     second_diagonal = float(np.linalg.norm(observation.extents))
     gate = max(1.5, 0.75 * (first_diagonal + second_diagonal))
     if distance > gate:
@@ -421,12 +459,12 @@ def _association_cost(track: list[Observation], observation: Observation) -> flo
         1.5,
         abs(math.log(max(second_diagonal, 1e-3) / max(first_diagonal, 1e-3))),
     )
-    return distance / gate + 0.5 * (1.0 - iou) + 0.25 * abs(
-        size_penalty
-    )
+    return distance / gate + 0.5 * (1.0 - iou) + 0.25 * abs(size_penalty)
 
 
-def associate_observations(observations: Sequence[Observation]) -> list[list[Observation]]:
+def associate_observations(
+    observations: Sequence[Observation],
+) -> list[list[Observation]]:
     tracks: list[list[Observation]] = []
     frames = sorted({value.scan_index for value in observations})
     for scan_index in frames:
@@ -435,7 +473,9 @@ def associate_observations(observations: Sequence[Observation]) -> list[list[Obs
             key=lambda value: (value.prompt.casefold(), value.id),
         )
         for prompt in sorted({value.prompt.casefold() for value in frame_values}):
-            current = [value for value in frame_values if value.prompt.casefold() == prompt]
+            current = [
+                value for value in frame_values if value.prompt.casefold() == prompt
+            ]
             candidates = [
                 index
                 for index, track in enumerate(tracks)
@@ -450,7 +490,7 @@ def associate_observations(observations: Sequence[Observation]) -> list[list[Obs
                         if math.isfinite(cost):
                             costs[row, column] = cost
                 rows, columns = linear_sum_assignment(costs)
-                for row, column in zip(rows, columns):
+                for row, column in zip(rows, columns, strict=False):
                     if costs[row, column] <= 1.75:
                         tracks[candidates[int(row)]].append(current[int(column)])
                         assigned_observations.add(int(column))
@@ -482,7 +522,9 @@ def _merge_fragmented_tracks(
                     continue
                 second_centroid = _track_centroid(second)
                 second_diagonal = float(
-                    np.linalg.norm(np.median([value.extents for value in second], axis=0))
+                    np.linalg.norm(
+                        np.median([value.extents for value in second], axis=0)
+                    )
                 )
                 distance = float(np.linalg.norm(first_centroid - second_centroid))
                 gate = max(1.5, 0.5 * (first_diagonal + second_diagonal))
@@ -651,7 +693,9 @@ def _motion_record(track: Sequence[Observation], minimum_speed: float) -> Motion
     )
 
 
-def _dynamic_record(track: Sequence[Observation], minimum_speed: float) -> tuple[bool, float]:
+def _dynamic_record(
+    track: Sequence[Observation], minimum_speed: float
+) -> tuple[bool, float]:
     """Backward-compatible summary used by callers and older tests."""
 
     motion = _motion_record(track, minimum_speed)
@@ -685,7 +729,9 @@ def _select_consistent_depth_candidates(
                     continue
                 anchor_centroid = _track_centroid(anchor)
                 anchor_diagonal = float(
-                    np.linalg.norm(np.median([value.extents for value in anchor], axis=0))
+                    np.linalg.norm(
+                        np.median([value.extents for value in anchor], axis=0)
+                    )
                 )
                 distance = float(np.linalg.norm(candidate.centroid - anchor_centroid))
                 gate = max(
@@ -703,27 +749,47 @@ def _select_consistent_depth_candidates(
     return selected
 
 
-def _select_observation(values: Sequence[Observation]) -> Observation:
-    """Score track views while penalizing incomplete or depth-incoherent masks."""
+def _rank_observations(values: Sequence[Observation]) -> list[Observation]:
+    """Rank reconstruction views with an inspectable, panorama-aware score."""
 
+    if not values:
+        return []
     max_area = max(value.mask_area_px for value in values)
-    for value in values:
-        value.quality = (
-            0.45 * value.score
-            + 0.20 * value.mask_area_px / max(max_area, 1)
-            + 0.20 * value.valid_depth_fraction
-            + 0.15 * value.inlier_fraction
-            - (0.25 if value.border_touch else 0.0)
-        )
-    return max(
+    center = np.median(np.asarray([value.centroid for value in values]), axis=0)
+    residuals = np.asarray(
+        [float(np.linalg.norm(value.centroid - center)) for value in values]
+    )
+    consistency_scale = max(float(np.median(residuals)), 0.5)
+    for value, residual in zip(values, residuals, strict=False):
+        components = {
+            "sam_score": 0.30 * value.score,
+            "inlier_fraction": 0.20 * value.inlier_fraction,
+            "valid_depth_fraction": 0.15 * value.valid_depth_fraction,
+            "relative_mask_area": 0.15
+            * math.sqrt(value.mask_area_px / max(max_area, 1)),
+            "track_consistency": 0.10 * math.exp(-residual / consistency_scale),
+            "vertical_edge_clearance": 0.10 * value.vertical_edge_clearance,
+        }
+        value.quality_components = components
+        value.quality = float(sum(components.values()))
+    ranked = sorted(
         values,
         key=lambda value: (
-            value.quality,
-            value.score,
-            value.mask_area_px,
-            -value.median_range_m,
+            bool(value.vertical_border_touch),
+            -value.quality,
+            -value.score,
+            -value.mask_area_px,
+            value.median_range_m,
+            value.id,
         ),
     )
+    for rank, value in enumerate(ranked, 1):
+        value.selection_rank = rank
+    return ranked
+
+
+def _select_observation(values: Sequence[Observation]) -> Observation:
+    return _rank_observations(values)[0]
 
 
 def _combine_observation_points(
@@ -750,7 +816,7 @@ def _range_eligible_observations(
 def _reconstruction_reliable_observations(
     values: Sequence[Observation],
 ) -> list[Observation]:
-    """Keep depth components that explain a meaningful part of their SAM mask."""
+    """Return strong observations for legacy callers and motion diagnostics."""
 
     return [
         value
@@ -759,14 +825,90 @@ def _reconstruction_reliable_observations(
     ]
 
 
-def _track_status(motion_state: str, has_range_eligible_observation: bool) -> str:
-    if motion_state == "dynamic":
-        return "dynamic_skipped"
-    if motion_state == "unconfirmed":
-        return "unconfirmed_skipped"
-    if motion_state == "confirmed_static":
-        return "pending" if has_range_eligible_observation else "range_skipped"
-    raise ValueError(f"unsupported motion state {motion_state!r}")
+def _evidence_gate(values: Sequence[Observation]) -> dict[str, Any]:
+    """Select strong observations or a repeatable weak spatial consensus."""
+
+    ordered = sorted(values, key=lambda value: value.id)
+    if not ordered:
+        return {
+            "eligible": False,
+            "reason": "no observations are available",
+            "strong_observation_ids": [],
+            "weak_observation_ids": [],
+            "consensus_observation_ids": [],
+            "eligible_observation_ids": [],
+            "consensus_center_world": None,
+            "consensus_radius_m": None,
+            "medoid_observation_id": None,
+        }
+    centroids = np.asarray([value.centroid for value in ordered], dtype=np.float64)
+    pairwise = np.linalg.norm(centroids[:, None, :] - centroids[None, :, :], axis=-1)
+    medoid_index = min(
+        range(len(ordered)),
+        key=lambda index: (float(np.sum(pairwise[index])), ordered[index].id),
+    )
+    horizontal_diagonals = [
+        float(np.linalg.norm(np.asarray(value.extents[:2], dtype=np.float64)))
+        for value in ordered
+    ]
+    radius = float(np.clip(0.5 * np.median(horizontal_diagonals), 1.0, 2.0))
+    consensus = [
+        value
+        for value, distance in zip(ordered, pairwise[medoid_index], strict=False)
+        if float(distance) <= radius
+    ]
+    strong = [
+        value
+        for value in ordered
+        if value.inlier_fraction >= MIN_RECONSTRUCTION_INLIER_FRACTION
+    ]
+    weak = [
+        value
+        for value in ordered
+        if value.inlier_fraction < MIN_RECONSTRUCTION_INLIER_FRACTION
+    ]
+    strong_ids = {value.id for value in strong}
+    consensus_strong = [value for value in consensus if value.id in strong_ids]
+    consensus_weak = [value for value in consensus if value.id not in strong_ids]
+    weak_scans = {value.scan_index for value in consensus_weak}
+    weak_consensus = len(weak_scans) >= 2
+    if consensus_strong:
+        eligible_values = consensus_strong
+        reason = "strong observations belong to the spatial consensus"
+    elif strong:
+        eligible_values = strong
+        reason = "at least one strong observation is available"
+    elif weak_consensus:
+        eligible_values = consensus_weak
+        reason = "weak observations repeat at a consistent world location"
+    else:
+        eligible_values = []
+        reason = "no strong observation or repeatable weak spatial consensus"
+    return {
+        "eligible": bool(eligible_values),
+        "reason": reason,
+        "min_strong_inlier_fraction": MIN_RECONSTRUCTION_INLIER_FRACTION,
+        "strong_observation_ids": [value.id for value in strong],
+        "weak_observation_ids": [value.id for value in weak],
+        "consensus_observation_ids": [value.id for value in consensus],
+        "eligible_observation_ids": [value.id for value in eligible_values],
+        "consensus_center_world": centroids[medoid_index].tolist(),
+        "consensus_radius_m": radius,
+        "medoid_observation_id": ordered[medoid_index].id,
+    }
+
+
+def _track_status(has_evidence: bool, has_range_eligible_evidence: bool) -> str:
+    if not has_evidence:
+        return "evidence_skipped"
+    return "pending" if has_range_eligible_evidence else "range_skipped"
+
+
+def _evidence_observations(
+    values: Sequence[Observation], gate: dict[str, Any]
+) -> list[Observation]:
+    eligible_ids = set(gate.get("eligible_observation_ids") or [])
+    return [value for value in values if value.id in eligible_ids]
 
 
 def track_evidence_summary(track: dict[str, Any]) -> dict[str, Any]:
@@ -784,15 +926,23 @@ def track_evidence_summary(track: dict[str, Any]) -> dict[str, Any]:
     return {
         "primary_component_fraction": float(
             np.mean(
-                [int(value.get("depth_candidate_rank", 0)) == 0 for value in observations]
+                [
+                    int(value.get("depth_candidate_rank", 0)) == 0
+                    for value in observations
+                ]
             )
         ),
         "median_inlier_fraction": float(
-            np.median([float(value.get("inlier_fraction", 0.0)) for value in observations])
+            np.median(
+                [float(value.get("inlier_fraction", 0.0)) for value in observations]
+            )
         ),
         "median_valid_depth_fraction": float(
             np.median(
-                [float(value.get("valid_depth_fraction", 0.0)) for value in observations]
+                [
+                    float(value.get("valid_depth_fraction", 0.0))
+                    for value in observations
+                ]
             )
         ),
         "observation_count": len(observations),
@@ -824,9 +974,10 @@ def duplicate_track_evidence(
 ) -> Optional[dict[str, Any]]:
     """Describe coincident same-prompt track support, or return ``None``."""
 
-    if str(first.get("prompt", "")).casefold() != str(
-        second.get("prompt", "")
-    ).casefold():
+    if (
+        str(first.get("prompt", "")).casefold()
+        != str(second.get("prompt", "")).casefold()
+    ):
         return None
     first_observations = list(first.get("observations") or [])
     second_observations = list(second.get("observations") or [])
@@ -875,7 +1026,10 @@ def duplicate_track_evidence(
 
 
 def _track_is_reconstruction_candidate(track: dict[str, Any]) -> bool:
-    if track.get("motion_state") != "confirmed_static":
+    if track.get("status") != "pending":
+        return False
+    evidence_gate = track.get("evidence_gate")
+    if evidence_gate is not None and not bool(evidence_gate.get("eligible")):
         return False
     range_gate = track.get("range_gate")
     return range_gate is None or bool(range_gate.get("eligible", True))
@@ -886,7 +1040,9 @@ def suppress_duplicate_track_documents(
 ) -> dict[str, Any]:
     """Mark lower-evidence coincident tracks before SAM 3D reconstruction."""
 
-    candidates = [track for track in tracks if _track_is_reconstruction_candidate(track)]
+    candidates = [
+        track for track in tracks if _track_is_reconstruction_candidate(track)
+    ]
     report: dict[str, Any] = {
         "enabled": config.suppress_duplicate_tracks,
         "config": {
@@ -943,12 +1099,22 @@ def _track_document(
     dynamic_min_speed_mps: float,
     max_mesh_range_m: Optional[float],
 ) -> dict[str, Any]:
-    reliable = _reconstruction_reliable_observations(values)
-    reliable_ids = {value.id for value in reliable}
-    overall_selected = _select_observation(reliable or values)
-    range_eligible = _range_eligible_observations(reliable, max_mesh_range_m)
-    selected = _select_observation(range_eligible) if range_eligible else overall_selected
-    motion = _motion_record(reliable, dynamic_min_speed_mps)
+    strong = _reconstruction_reliable_observations(values)
+    strong_ids = {value.id for value in strong}
+    evidence_gate = _evidence_gate(values)
+    evidence = _evidence_observations(values, evidence_gate)
+    in_range = _range_eligible_observations(values, max_mesh_range_m)
+    in_range_evidence_gate = _evidence_gate(in_range)
+    range_eligible = _evidence_observations(in_range, in_range_evidence_gate)
+    consensus_ids = set(evidence_gate["consensus_observation_ids"])
+    range_eligible_ids = {value.id for value in range_eligible}
+    for value in values:
+        value.evidence_class = "strong" if value.id in strong_ids else "weak"
+        value.in_evidence_consensus = value.id in consensus_ids
+        value.reconstruction_eligible = value.id in range_eligible_ids
+    ranked = _rank_observations(range_eligible or evidence or values)
+    selected = ranked[0]
+    motion = _motion_record(strong, dynamic_min_speed_mps)
     combined = _combine_observation_points(run_dir, values)
     track_dir = run_dir / "tracks" / track_id
     track_dir.mkdir(parents=True, exist_ok=True)
@@ -965,7 +1131,13 @@ def _track_document(
         reconstruction_centroid = np.median(
             np.asarray([value.centroid for value in range_eligible]), axis=0
         )
-    source_frame = next(frame for frame in read_route_manifest(run_dir)["keyframes"] if frame["id"] == selected.frame_id)
+    route_manifest = read_route_manifest(run_dir)
+    source_frames = list(route_manifest["keyframes"]) + list(
+        route_manifest.get("recovery_frames", [])
+    )
+    source_frame = next(
+        frame for frame in source_frames if frame["id"] == selected.frame_id
+    )
     rgb_source = artifact_path(run_dir, source_frame["rgb"])
     mask_source = artifact_path(run_dir, selected.mask_path)
     rgb_target = track_dir / "best_rgb.png"
@@ -973,20 +1145,21 @@ def _track_document(
     shutil.copy2(rgb_source, rgb_target)
     shutil.copy2(mask_source, mask_target)
     fused_centroid = np.median(np.asarray([value.centroid for value in values]), axis=0)
-    status = _track_status(motion.state, bool(range_eligible))
-    minimum_range = min(
-        value.median_range_m for value in (reliable if reliable else values)
-    )
+    status = _track_status(bool(evidence), bool(range_eligible))
+    minimum_range = min(value.median_range_m for value in (evidence or values))
     if max_mesh_range_m is None:
         range_reason = "mesh range limit is disabled"
-    elif not reliable:
-        range_reason = (
-            "no observation meets the reconstruction inlier-fraction quality gate"
-        )
+    elif not evidence:
+        range_reason = "no observation meets the reconstruction evidence gate"
     elif range_eligible:
         range_reason = (
             f"{len(range_eligible)} observation(s) are at or below "
             f"{max_mesh_range_m:g} m"
+        )
+    elif in_range:
+        range_reason = (
+            "in-range observations do not independently satisfy the "
+            "reconstruction evidence gate"
         )
     else:
         range_reason = (
@@ -1001,17 +1174,25 @@ def _track_document(
         "motion": asdict(motion),
         "dynamic": motion.dynamic,
         "estimated_speed_mps": motion.estimated_speed_mps,
+        "motion_gate_applied": False,
         "centroid_world": fused_centroid.tolist(),
         "observations": [asdict(value) for value in values],
         "selected_observation_id": selected.id,
+        "ranked_observation_ids": [value.id for value in ranked],
         "quality_gate": {
             "min_inlier_fraction": MIN_RECONSTRUCTION_INLIER_FRACTION,
-            "accepted_observation_count": len(reliable),
-            "accepted_observation_ids": [value.id for value in reliable],
-            "rejected_observation_count": len(values) - len(reliable),
+            "accepted_observation_count": len(strong),
+            "accepted_observation_ids": [value.id for value in strong],
+            "rejected_observation_count": len(values) - len(strong),
             "rejected_observation_ids": [
-                value.id for value in values if value.id not in reliable_ids
+                value.id for value in values if value.id not in strong_ids
             ],
+        },
+        "evidence_gate": {
+            **evidence_gate,
+            "range_eligible": bool(range_eligible),
+            "range_eligible_observation_ids": [value.id for value in range_eligible],
+            "range_eligible_reason": in_range_evidence_gate["reason"],
         },
         "points": relative_artifact(run_dir, points_path),
         "reconstruction_points": (
@@ -1104,7 +1285,9 @@ def retrack_route(
     if segment_stage.get("status") != "complete":
         raise RuntimeError("segment stage must complete before model-free retracking")
     if manifest.get("tracks") and not overwrite:
-        raise RuntimeError("tracking artifacts already exist; pass --overwrite to replace them")
+        raise RuntimeError(
+            "tracking artifacts already exist; pass --overwrite to replace them"
+        )
     values = dict(segment_stage.get("config") or {})
     if not values:
         raise RuntimeError("segment stage does not contain its resolved configuration")
@@ -1113,9 +1296,7 @@ def retrack_route(
     values["max_mesh_range_m"] = max_mesh_range_m
     values["suppress_duplicate_tracks"] = suppress_duplicate_tracks
     values["duplicate_track_max_centroid_m"] = duplicate_track_max_centroid_m
-    values["duplicate_track_min_shared_fraction"] = (
-        duplicate_track_min_shared_fraction
-    )
+    values["duplicate_track_min_shared_fraction"] = duplicate_track_min_shared_fraction
     values["duplicate_track_min_containment"] = duplicate_track_min_containment
     if min_range_points is not None:
         values["min_range_points"] = min_range_points
@@ -1160,7 +1341,17 @@ def segment_route(
         and stage.get("config_sha256") != config_digest(config.manifest_value())
         and not overwrite
     ):
-        raise RuntimeError("segment configuration changed; pass --overwrite to replace artifacts")
+        raise RuntimeError(
+            "segment configuration changed; pass --overwrite to replace artifacts"
+        )
+    if overwrite:
+        for frame in list(manifest["keyframes"]) + list(
+            manifest.get("recovery_frames", [])
+        ):
+            directory = run_dir / "frames" / frame["id"] / "segmentation"
+            if directory.exists():
+                shutil.rmtree(directory)
+            frame["mask_manifest"] = None
     for name in ("observations", "tracks", "meshes"):
         directory = run_dir / name
         if directory.exists():
@@ -1177,7 +1368,7 @@ def segment_route(
     update_stage(manifest, "segment", config.manifest_value(), status="running")
     atomic_write_json(manifest_path, manifest)
     try:
-        command = [
+        base_command = [
             config.sam3_executable,
             "--run-dir",
             str(run_dir),
@@ -1191,17 +1382,54 @@ def segment_route(
             config.sam3_device,
             "--dtype",
             config.sam3_dtype,
+            "--prompts",
+            ",".join(config.prompts),
         ]
-        for prompt in config.prompts:
-            command.extend(("--prompt", prompt))
+        if config.synonyms.strip():
+            base_command.extend(("--synonyms", config.synonyms))
+        command = list(base_command)
+        for frame in manifest["keyframes"]:
+            command.extend(("--frame-id", frame["id"]))
         if overwrite:
             command.append("--overwrite")
         completed = subprocess_run(command, check=False)
         if completed.returncode != 0:
-            raise RuntimeError(f"SAM3 route batch exited with status {completed.returncode}")
+            raise RuntimeError(
+                f"SAM3 route batch exited with status {completed.returncode}"
+            )
         manifest = read_route_manifest(manifest_path)
         tracks_path = build_tracks(run_dir, manifest, config)
+        recovery_report: dict[str, Any] = {
+            "enabled": config.adaptive_sam3_recovery,
+            "available": bool(manifest.get("recovery_frames")),
+            "configured_rounds": config.sam3_recovery_rounds,
+            "rounds": [],
+        }
+        if config.adaptive_sam3_recovery and manifest.get("recovery_frames"):
+            for round_index in range(config.sam3_recovery_rounds):
+                tracks_document = read_tracks(tracks_path)
+                frame_ids = _select_recovery_frame_ids(manifest, tracks_document)
+                if not frame_ids:
+                    break
+                recovery_command = list(base_command)
+                for frame_id in frame_ids:
+                    recovery_command.extend(("--frame-id", frame_id))
+                completed = subprocess_run(recovery_command, check=False)
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        f"SAM3 recovery batch exited with status {completed.returncode}"
+                    )
+                manifest = read_route_manifest(manifest_path)
+                tracks_path = build_tracks(run_dir, manifest, config)
+                recovery_report["rounds"].append(
+                    {"round": round_index + 1, "frame_ids": frame_ids}
+                )
+        manifest = read_route_manifest(manifest_path)
         manifest["prompts"] = list(config.prompts)
+        catalog = build_prompt_catalog(config.prompts, config.synonyms)
+        manifest["synonyms"] = catalog.normalized_synonyms()
+        manifest["prompt_categories"] = list(catalog.categories)
+        manifest["sam3_recovery"] = recovery_report
         manifest["tracks"] = relative_artifact(run_dir, tracks_path)
         update_stage(manifest, "segment", config.manifest_value(), status="complete")
         atomic_write_json(manifest_path, manifest)
@@ -1217,3 +1445,55 @@ def segment_route(
         )
         atomic_write_json(manifest_path, manifest)
         raise
+
+
+def _track_needs_recovery(track: dict[str, Any]) -> bool:
+    if track.get("status") == "duplicate_skipped":
+        return False
+    observations = list(track.get("observations") or [])
+    if not observations:
+        return False
+    evidence_gate = track.get("evidence_gate") or {}
+    if len(observations) < 2 or not bool(evidence_gate.get("eligible", False)):
+        return True
+    if track.get("status") == "range_skipped":
+        return True
+    eligible_ids = set(evidence_gate.get("range_eligible_observation_ids") or [])
+    eligible = [value for value in observations if value.get("id") in eligible_ids]
+    return not any(
+        not bool(value.get("vertical_border_touch", value.get("border_touch", False)))
+        and float(value.get("inlier_fraction", 0.0))
+        >= MIN_RECONSTRUCTION_INLIER_FRACTION
+        for value in eligible
+    )
+
+
+def _select_recovery_frame_ids(
+    manifest: dict[str, Any], tracks_document: dict[str, Any]
+) -> list[str]:
+    candidates = [
+        frame
+        for frame in manifest.get("recovery_frames", [])
+        if not frame.get("mask_manifest")
+    ]
+    selected: set[str] = set()
+    for track in tracks_document.get("tracks", []):
+        if not _track_needs_recovery(track):
+            continue
+        scans = [int(value["scan_index"]) for value in track.get("observations", [])]
+        if not scans:
+            continue
+        before = [
+            frame for frame in candidates if int(frame["scan_index"]) < min(scans)
+        ]
+        after = [frame for frame in candidates if int(frame["scan_index"]) > max(scans)]
+        if before:
+            selected.add(max(before, key=lambda frame: int(frame["scan_index"]))["id"])
+        if after:
+            selected.add(min(after, key=lambda frame: int(frame["scan_index"]))["id"])
+    return sorted(
+        selected,
+        key=lambda frame_id: next(
+            int(frame["scan_index"]) for frame in candidates if frame["id"] == frame_id
+        ),
+    )

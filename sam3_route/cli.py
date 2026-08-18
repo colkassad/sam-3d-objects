@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
+from sam3_masking.prompts import parse_prompt_catalog
+
 from .extract import ExtractConfig, extract_route
 from .reconstruct import ReconstructConfig, reconstruct_route
 from .scene import SceneConfig, compose_scene
@@ -18,7 +20,6 @@ from .surface import (
     segment_surface_route,
 )
 from .tracking import SegmentConfig, retrack_route, segment_route
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -70,6 +71,7 @@ def _add_extract_options(
     parser.add_argument("--meta", type=Path)
     parser.add_argument("--keyframe-distance-m", type=float, default=5.0)
     parser.add_argument("--keyframe-angle-deg", type=float, default=5.0)
+    parser.add_argument("--sam3-recovery-distance-m", type=float, default=1.0)
     parser.add_argument("--slam-min-range-m", type=float, default=1.0)
     parser.add_argument("--slam-max-range-m", type=float, default=75.0)
     parser.add_argument("--slam-voxel-size-m", type=float, default=1.0)
@@ -96,11 +98,11 @@ def _add_segment_options(
     parser: argparse.ArgumentParser, *, require_prompt: bool
 ) -> None:
     parser.add_argument(
-        "--prompt",
-        action="append",
+        "--prompts",
         required=require_prompt,
-        help="Repeat for each object concept.",
+        help="Comma-separated object concepts.",
     )
+    parser.add_argument("--synonyms", default="")
     parser.add_argument(
         "--sam3-model-dir", type=Path, default=Path("checkpoints/sam3-hf")
     )
@@ -115,6 +117,12 @@ def _add_segment_options(
     parser.add_argument("--dynamic-min-speed-mps", type=float, default=0.5)
     _add_mesh_range_options(parser)
     _add_duplicate_track_options(parser)
+    parser.add_argument(
+        "--adaptive-sam3-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--sam3-recovery-rounds", type=int, default=2)
 
 
 def _add_duplicate_track_options(parser: argparse.ArgumentParser) -> None:
@@ -152,11 +160,11 @@ def _add_surface_segment_options(
     parser: argparse.ArgumentParser, *, require_prompt: bool
 ) -> None:
     parser.add_argument(
-        "--prompt",
-        action="append",
+        "--prompts",
         required=require_prompt,
-        help="Repeat for every text description of the target surface.",
+        help="Comma-separated text descriptions of the target surface.",
     )
+    parser.add_argument("--synonyms", default="")
     parser.add_argument(
         "--sam3-model-dir", type=Path, default=Path("checkpoints/sam3-hf")
     )
@@ -225,15 +233,10 @@ def _add_reconstruct_options(parser: argparse.ArgumentParser) -> None:
         "--fit-align-long-axis", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--fit-max-up-tilt-deg", type=float, default=20.0)
+    parser.add_argument("--max-reconstruction-view-attempts", type=int, default=3)
 
 
 def _add_scene_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--suppress-overlapping-meshes",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Suppress lower-quality overlapping same-prompt meshes in scene.glb.",
-    )
     parser.add_argument("--mesh-overlap-min-iou", type=float, default=0.35)
     parser.add_argument("--mesh-overlap-min-containment", type=float, default=0.75)
     parser.add_argument("--mesh-vertical-overlap-min", type=float, default=0.50)
@@ -246,24 +249,29 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Extract, segment, and reconstruct Ouster route objects and surfaces."
         ),
+        allow_abbrev=False,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     extract = subparsers.add_parser(
-        "extract", help="Run SLAM and export motion-selected keyframes."
+        "extract",
+        help="Run SLAM and export motion-selected keyframes.",
+        allow_abbrev=False,
     )
     _add_extract_options(extract, include_source=True)
     extract.add_argument("--overwrite", action="store_true")
 
     segment = subparsers.add_parser(
-        "segment", help="Run batch SAM3 and associate observations."
+        "segment", help="Run batch SAM3 and associate observations.", allow_abbrev=False
     )
     segment.add_argument("run_dir", type=Path)
     _add_segment_options(segment, require_prompt=True)
     segment.add_argument("--overwrite", action="store_true")
 
     track = subparsers.add_parser(
-        "track", help="Rebuild depth hypotheses and tracks from saved SAM3 masks."
+        "track",
+        help="Rebuild depth hypotheses and tracks from saved SAM3 masks.",
+        allow_abbrev=False,
     )
     track.add_argument("run_dir", type=Path)
     track.add_argument("--min-range-points", type=int)
@@ -273,14 +281,18 @@ def build_parser() -> argparse.ArgumentParser:
     track.add_argument("--overwrite", action="store_true")
 
     reconstruct = subparsers.add_parser(
-        "reconstruct", help="Generate and place one mesh per confirmed-static track."
+        "reconstruct",
+        help="Generate and validate one mesh per evidence-qualified track.",
+        allow_abbrev=False,
     )
     reconstruct.add_argument("run_dir", type=Path)
     _add_reconstruct_options(reconstruct)
     _add_scene_options(reconstruct)
     reconstruct.add_argument("--overwrite", action="store_true")
 
-    run = subparsers.add_parser("run", help="Run all stages with resumable artifacts.")
+    run = subparsers.add_parser(
+        "run", help="Run all stages with resumable artifacts.", allow_abbrev=False
+    )
     _add_extract_options(run, include_source=True)
     _add_segment_options(run, require_prompt=True)
     _add_reconstruct_options(run)
@@ -288,11 +300,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--overwrite", action="store_true")
 
     scene = subparsers.add_parser(
-        "scene", help="Compose positioned object GLBs without running SAM 3D."
+        "scene",
+        help="Compose positioned object GLBs without running SAM 3D.",
+        allow_abbrev=False,
     )
     scene_commands = scene.add_subparsers(dest="scene_command", required=True)
     scene_build = scene_commands.add_parser(
-        "build", help="Rebuild scene.glb from existing individual object GLBs."
+        "build",
+        help="Rebuild scene.glb from existing individual object GLBs.",
+        allow_abbrev=False,
     )
     scene_build.add_argument("run_dir", type=Path)
     _add_scene_options(scene_build)
@@ -301,10 +317,11 @@ def build_parser() -> argparse.ArgumentParser:
     surface = subparsers.add_parser(
         "surface",
         help="Segment and triangulate a large prompted route surface without SAM 3D.",
+        allow_abbrev=False,
     )
     surface_commands = surface.add_subparsers(dest="surface_command", required=True)
     surface_run = surface_commands.add_parser(
-        "run", help="Extract, segment, and build a surface TIN."
+        "run", help="Extract, segment, and build a surface TIN.", allow_abbrev=False
     )
     _add_extract_options(surface_run, include_source=True)
     surface_run.set_defaults(keyframe_distance_m=1.0)
@@ -313,14 +330,18 @@ def build_parser() -> argparse.ArgumentParser:
     surface_run.add_argument("--overwrite", action="store_true")
 
     surface_segment = surface_commands.add_parser(
-        "segment", help="Run SAM 3 into independent surface mask artifacts."
+        "segment",
+        help="Run SAM 3 into independent surface mask artifacts.",
+        allow_abbrev=False,
     )
     surface_segment.add_argument("run_dir", type=Path)
     _add_surface_segment_options(surface_segment, require_prompt=True)
     surface_segment.add_argument("--overwrite", action="store_true")
 
     surface_build = surface_commands.add_parser(
-        "build", help="Build a point cloud and TIN from saved surface masks."
+        "build",
+        help="Build a point cloud and TIN from saved surface masks.",
+        allow_abbrev=False,
     )
     surface_build.add_argument("run_dir", type=Path)
     _add_tin_options(surface_build)
@@ -332,6 +353,7 @@ def _extract_config(args: argparse.Namespace) -> ExtractConfig:
     return ExtractConfig(
         keyframe_distance_m=args.keyframe_distance_m,
         keyframe_angle_deg=args.keyframe_angle_deg,
+        sam3_recovery_distance_m=args.sam3_recovery_distance_m,
         slam_min_range_m=args.slam_min_range_m,
         slam_max_range_m=args.slam_max_range_m,
         slam_voxel_size_m=args.slam_voxel_size_m,
@@ -345,9 +367,11 @@ def _extract_config(args: argparse.Namespace) -> ExtractConfig:
 
 def _segment_config(args: argparse.Namespace) -> SegmentConfig:
     executable = discover_batch_executable(args.sam3_executable)
+    catalog = parse_prompt_catalog(args.prompts, args.synonyms)
     return SegmentConfig(
-        prompts=tuple(value.strip() for value in args.prompt),
+        prompts=catalog.prompts,
         sam3_model_dir=str(_resolve_repo_path(args.sam3_model_dir)),
+        synonyms=args.synonyms,
         sam3_executable=str(executable),
         sam3_device=args.sam3_device,
         sam3_dtype=args.sam3_dtype,
@@ -360,6 +384,8 @@ def _segment_config(args: argparse.Namespace) -> SegmentConfig:
         duplicate_track_max_centroid_m=args.duplicate_track_max_centroid_m,
         duplicate_track_min_shared_fraction=args.duplicate_track_min_shared_fraction,
         duplicate_track_min_containment=args.duplicate_track_min_containment,
+        adaptive_sam3_recovery=args.adaptive_sam3_recovery,
+        sam3_recovery_rounds=args.sam3_recovery_rounds,
     )
 
 
@@ -385,14 +411,17 @@ def _reconstruct_config(args: argparse.Namespace) -> ReconstructConfig:
         fit_grounded=args.fit_grounded,
         fit_align_long_axis=args.fit_align_long_axis,
         fit_max_up_tilt_deg=args.fit_max_up_tilt_deg,
+        max_reconstruction_view_attempts=args.max_reconstruction_view_attempts,
     )
 
 
 def _surface_segment_config(args: argparse.Namespace) -> SurfaceSegmentConfig:
     executable = discover_batch_executable(args.sam3_executable)
+    catalog = parse_prompt_catalog(args.prompts, args.synonyms)
     return SurfaceSegmentConfig(
-        prompts=tuple(value.strip() for value in args.prompt),
+        prompts=catalog.prompts,
         sam3_model_dir=str(_resolve_repo_path(args.sam3_model_dir)),
+        synonyms=args.synonyms,
         sam3_executable=str(executable),
         sam3_device=args.sam3_device,
         sam3_dtype=args.sam3_dtype,
@@ -403,7 +432,6 @@ def _surface_segment_config(args: argparse.Namespace) -> SurfaceSegmentConfig:
 
 def _scene_config(args: argparse.Namespace) -> SceneConfig:
     return SceneConfig(
-        suppress_overlapping_meshes=args.suppress_overlapping_meshes,
         mesh_overlap_min_iou=args.mesh_overlap_min_iou,
         mesh_overlap_min_containment=args.mesh_overlap_min_containment,
         mesh_vertical_overlap_min=args.mesh_vertical_overlap_min,

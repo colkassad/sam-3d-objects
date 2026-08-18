@@ -16,6 +16,7 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import Delaunay, QhullError, cKDTree
 
 from sam3_masking.artifacts import load_mask_manifest
+from sam3_masking.prompts import build_prompt_catalog
 
 from .artifacts import (
     artifact_path,
@@ -30,7 +31,6 @@ from .artifacts import (
 from .extract import ExtractConfig, extract_route, write_binary_ply
 from .geometry import points_from_range, transform_pointmap_per_column
 
-
 SURFACE_SCHEMA = "ouster-surface-tin/v1"
 
 
@@ -38,6 +38,7 @@ SURFACE_SCHEMA = "ouster-surface-tin/v1"
 class SurfaceSegmentConfig:
     prompts: tuple[str, ...]
     sam3_model_dir: str
+    synonyms: str = ""
     sam3_executable: str = "sam3-mask-route"
     sam3_device: str = "auto"
     sam3_dtype: str = "auto"
@@ -45,8 +46,7 @@ class SurfaceSegmentConfig:
     mask_threshold: float = 0.5
 
     def __post_init__(self) -> None:
-        if not self.prompts or any(not value.strip() for value in self.prompts):
-            raise ValueError("at least one nonempty surface prompt is required")
+        build_prompt_catalog(self.prompts, self.synonyms)
         if not 0.0 <= self.score_threshold <= 1.0:
             raise ValueError("score_threshold must be between 0 and 1")
         if not 0.0 <= self.mask_threshold <= 1.0:
@@ -245,8 +245,9 @@ def segment_surface_route(
             "--artifact-set",
             "surface",
         ]
-        for prompt in config.prompts:
-            command.extend(("--prompt", prompt))
+        command.extend(("--prompts", ",".join(config.prompts)))
+        if config.synonyms.strip():
+            command.extend(("--synonyms", config.synonyms))
         if overwrite:
             command.append("--overwrite")
         completed = subprocess_run(command, check=False)

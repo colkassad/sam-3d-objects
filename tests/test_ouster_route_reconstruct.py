@@ -8,17 +8,91 @@ from PIL import Image
 from sam3_route.artifacts import ROUTE_MANIFEST_SCHEMA, TRACKS_SCHEMA, atomic_write_json
 from sam3_route.reconstruct import (
     ReconstructConfig,
+    _reconstruction_eligible,
+    align_mesh_to_observation_tangent,
     reconstruct_route,
     stabilize_mesh_orientation,
+    validate_mesh_placement,
 )
+
+
+def test_motion_is_diagnostic_for_evidence_first_tracks():
+    track = {
+        "status": "pending",
+        "motion_state": "dynamic",
+        "dynamic": True,
+        "motion_gate_applied": False,
+        "evidence_gate": {"eligible": True, "range_eligible": True},
+    }
+
+    assert _reconstruction_eligible(track) is True
+
+
+def test_tangent_alignment_preserves_depth_and_corrects_lateral_offset():
+    vertices = np.asarray(trimesh.creation.box(extents=(2, 2, 2)).vertices)
+    transform = np.eye(4)
+    transform[:3, 3] = [5.0, 3.0, 0.0]
+    support = np.asarray([[5.0, 0.0, 0.0], [5.0, 0.2, 0.0]])
+
+    aligned, report = align_mesh_to_observation_tangent(
+        vertices, transform, support, [1.0, 0.0, 0.0]
+    )
+
+    assert report["applied"] is True
+    assert aligned[0, 3] == pytest.approx(5.0)
+    assert aligned[1, 3] == pytest.approx(0.1)
+
+
+def test_placement_validation_rejects_bad_depth_and_neighbor_centroid(
+    monkeypatch,
+):
+    mesh = trimesh.creation.box(extents=(4, 2, 2))
+    good_metrics = {
+        "views": [],
+        "view_count": 1,
+        "median_depth_residual_m": 0.20,
+        "hit_fraction": 0.95,
+        "false_background_fraction": 0.10,
+        "median_range_m": 10.0,
+    }
+    monkeypatch.setattr(
+        "sam3_route.reconstruct.evaluate_mesh_views",
+        lambda *args, **kwargs: dict(good_metrics),
+    )
+    track = {"id": "track-a", "prompt": "car", "centroid_world": [0, 0, 0]}
+    neighbor = {
+        "id": "track-b",
+        "prompt": "car",
+        "status": "pending",
+        "centroid_world": [0.5, 0, 0],
+    }
+
+    blocked = validate_mesh_placement(
+        mesh.vertices,
+        mesh.faces,
+        np.eye(4),
+        [object()],
+        track,
+        [track, neighbor],
+    )
+    assert blocked["accepted"] is False
+    assert blocked["checks"]["neighbor_centroids_clear"] is False
+
+    monkeypatch.setattr(
+        "sam3_route.reconstruct.evaluate_mesh_views",
+        lambda *args, **kwargs: {**good_metrics, "median_depth_residual_m": 0.80},
+    )
+    bad_depth = validate_mesh_placement(
+        mesh.vertices, mesh.faces, np.eye(4), [object()], track, [track]
+    )
+    assert bad_depth["accepted"] is False
+    assert bad_depth["checks"]["depth_residual"] is False
 
 
 def test_orientation_prior_turns_object_upright_and_aligns_long_axis():
     vertices = np.asarray(trimesh.creation.box(extents=(2, 2, 6)).vertices)
     desired = np.eye(4)
-    desired[:3, :3] = np.asarray(
-        [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
-    )
+    desired[:3, :3] = np.asarray([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     desired[:3, 3] = [10.0, 20.0, 1.0]
     target = vertices @ desired[:3, :3].T + desired[:3, 3]
     upside_down = desired.copy()
@@ -26,9 +100,7 @@ def test_orientation_prior_turns_object_upright_and_aligns_long_axis():
         [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
     )
 
-    stabilized, report = stabilize_mesh_orientation(
-        vertices, target, upside_down
-    )
+    stabilized, report = stabilize_mesh_orientation(vertices, target, upside_down)
 
     axes = stabilized[:3, :3] / np.linalg.norm(stabilized[:3, :3], axis=0)
     assert axes[:, 1] @ [0.0, 0.0, 1.0] > 0.999
@@ -205,9 +277,7 @@ def test_reconstruct_writes_positioned_individual_and_aggregate_glbs(tmp_path):
     matrix = np.asarray(tracks["tracks"][0]["mesh"]["world_from_glb"])
     assert matrix.shape == (4, 4)
 
-    individual = trimesh.load(
-        run_dir / "meshes" / "track-000001.glb", force="scene"
-    )
+    individual = trimesh.load(run_dir / "meshes" / "track-000001.glb", force="scene")
     individual_node = list(individual.graph.nodes_geometry)[0]
     glb_matrix, _ = individual.graph[individual_node]
     np.testing.assert_allclose(glb_matrix, matrix, atol=1e-6)
@@ -227,6 +297,250 @@ def test_reconstruct_writes_positioned_individual_and_aggregate_glbs(tmp_path):
     assert second_path == scene_path
     assert second_failures == 0
     assert [call[0] for call in calls] == ["init", "infer"]
+
+
+def test_reconstruct_retries_ranked_views_and_records_attempts(tmp_path, monkeypatch):
+    run_dir, cube = make_route_run(tmp_path)
+    document = json.loads((run_dir / "tracks.json").read_text())
+    track = document["tracks"][0]
+    original = track["observations"][0]
+    observations = []
+    for index in range(3):
+        value = json.loads(json.dumps(original))
+        value["id"] = f"view-{index + 1}"
+        value["selection_rank"] = index + 1
+        observations.append(value)
+    track["observations"] = observations
+    track["selected_observation_id"] = "view-1"
+    track["ranked_observation_ids"] = ["view-1", "view-2", "view-3"]
+    atomic_write_json(run_dir / "tracks.json", document)
+    calls = []
+    monkeypatch.setattr(
+        "sam3_route.reconstruct.validate_mesh_placement",
+        lambda *args, **kwargs: {"accepted": True},
+    )
+
+    class FakeInference:
+        def __init__(self, config, **kwargs):
+            pass
+
+        def __call__(self, image, mask, **kwargs):
+            calls.append(len(calls) + 1)
+            if len(calls) < 3:
+                return {}
+            return {
+                "glb": cube.copy(),
+                "rotation": np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+                "translation": np.asarray([[0.0, 0.0, 5.0]]),
+                "scale": np.asarray([[1.0, 1.0, 1.0]]),
+            }
+
+    _, failures = reconstruct_route(
+        run_dir,
+        ReconstructConfig(
+            sam3d_config=str(tmp_path / "pipeline.yaml"), fit_mode="none"
+        ),
+        inference_factory=FakeInference,
+        image_loader=lambda path: np.asarray(Image.open(path).convert("RGB")),
+    )
+
+    assert failures == 0
+    assert calls == [1, 2, 3]
+    result = json.loads((run_dir / "tracks.json").read_text())["tracks"][0]
+    assert result["selected_observation_id"] == "view-3"
+    assert [value["status"] for value in result["reconstruction_attempts"]] == [
+        "failed",
+        "failed",
+        "ok",
+    ]
+
+
+def test_reconstruct_records_all_ranked_view_failures(tmp_path):
+    run_dir, _ = make_route_run(tmp_path)
+    document = json.loads((run_dir / "tracks.json").read_text())
+    track = document["tracks"][0]
+    original = track["observations"][0]
+    track["observations"] = []
+    for index in range(3):
+        value = json.loads(json.dumps(original))
+        value["id"] = f"view-{index + 1}"
+        track["observations"].append(value)
+    track["selected_observation_id"] = "view-1"
+    track["ranked_observation_ids"] = ["view-1", "view-2", "view-3"]
+    atomic_write_json(run_dir / "tracks.json", document)
+
+    class FailingInference:
+        def __init__(self, config, **kwargs):
+            pass
+
+        def __call__(self, image, mask, **kwargs):
+            return {}
+
+    _, failures = reconstruct_route(
+        run_dir,
+        ReconstructConfig(
+            sam3d_config=str(tmp_path / "pipeline.yaml"), fit_mode="none"
+        ),
+        inference_factory=FailingInference,
+        image_loader=lambda path: np.asarray(Image.open(path).convert("RGB")),
+    )
+
+    assert failures == 1
+    result = json.loads((run_dir / "tracks.json").read_text())["tracks"][0]
+    assert result["status"] == "failed"
+    assert result["selected_observation_id"] == "view-1"
+    assert [value["status"] for value in result["reconstruction_attempts"]] == [
+        "failed",
+        "failed",
+        "failed",
+    ]
+
+
+def test_reconstruct_retries_when_placement_validation_fails(tmp_path, monkeypatch):
+    run_dir, cube = make_route_run(tmp_path)
+    document = json.loads((run_dir / "tracks.json").read_text())
+    track = document["tracks"][0]
+    original = track["observations"][0]
+    track["observations"] = []
+    for index in range(3):
+        value = json.loads(json.dumps(original))
+        value["id"] = f"view-{index + 1}"
+        track["observations"].append(value)
+    track["selected_observation_id"] = "view-1"
+    track["ranked_observation_ids"] = ["view-1", "view-2", "view-3"]
+    atomic_write_json(run_dir / "tracks.json", document)
+    inference_calls = []
+    validation_calls = []
+
+    def fake_validation(*args, **kwargs):
+        validation_calls.append(len(validation_calls) + 1)
+        return {"accepted": len(validation_calls) >= 5}
+
+    monkeypatch.setattr(
+        "sam3_route.reconstruct.validate_mesh_placement", fake_validation
+    )
+
+    class FakeInference:
+        def __init__(self, config, **kwargs):
+            pass
+
+        def __call__(self, image, mask, **kwargs):
+            inference_calls.append(1)
+            return {
+                "glb": cube.copy(),
+                "rotation": np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+                "translation": np.asarray([[0.0, 0.0, 5.0]]),
+                "scale": np.asarray([[1.0, 1.0, 1.0]]),
+            }
+
+    _, failures = reconstruct_route(
+        run_dir,
+        ReconstructConfig(
+            sam3d_config=str(tmp_path / "pipeline.yaml"), fit_mode="none"
+        ),
+        inference_factory=FakeInference,
+        image_loader=lambda path: np.asarray(Image.open(path).convert("RGB")),
+    )
+
+    assert failures == 0
+    assert len(inference_calls) == 3
+    result = json.loads((run_dir / "tracks.json").read_text())["tracks"][0]
+    assert result["selected_observation_id"] == "view-3"
+    assert [value["status"] for value in result["reconstruction_attempts"]] == [
+        "failed",
+        "failed",
+        "ok",
+    ]
+    assert result["placement_mode"] == "multi_view"
+
+
+def test_reconstruct_falls_back_to_snapshot_when_multi_view_disagrees(
+    tmp_path, monkeypatch
+):
+    run_dir, cube = make_route_run(tmp_path)
+    validation_calls = []
+
+    def fake_validation(*args, **kwargs):
+        validation_calls.append(1)
+        return {"accepted": len(validation_calls) == 2}
+
+    monkeypatch.setattr(
+        "sam3_route.reconstruct.validate_mesh_placement", fake_validation
+    )
+    selected = "frame-000001-p000-i000"
+    monkeypatch.setattr(
+        "sam3_route.reconstruct.load_lidar_fit_views",
+        lambda *args, **kwargs: [
+            type("View", (), {"observation_id": selected})(),
+            type("View", (), {"observation_id": "other-view"})(),
+        ],
+    )
+
+    class FakeInference:
+        def __init__(self, config, **kwargs):
+            pass
+
+        def __call__(self, image, mask, **kwargs):
+            return {
+                "glb": cube.copy(),
+                "rotation": np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+                "translation": np.asarray([[0.0, 0.0, 5.0]]),
+                "scale": np.asarray([[1.0, 1.0, 1.0]]),
+            }
+
+    _, failures = reconstruct_route(
+        run_dir,
+        ReconstructConfig(
+            sam3d_config=str(tmp_path / "pipeline.yaml"), fit_mode="none"
+        ),
+        inference_factory=FakeInference,
+        image_loader=lambda path: np.asarray(Image.open(path).convert("RGB")),
+    )
+
+    assert failures == 0
+    result = json.loads((run_dir / "tracks.json").read_text())["tracks"][0]
+    assert result["placement_mode"] == "snapshot"
+    assert [
+        value["placement_mode"]
+        for value in result["reconstruction_attempts"][0]["placement_candidates"]
+    ] == ["multi_view", "snapshot"]
+
+
+def test_all_placement_attempts_fail_with_explicit_status(tmp_path, monkeypatch):
+    run_dir, cube = make_route_run(tmp_path)
+    monkeypatch.setattr(
+        "sam3_route.reconstruct.validate_mesh_placement",
+        lambda *args, **kwargs: {"accepted": False, "checks": {"depth": False}},
+    )
+
+    class FakeInference:
+        def __init__(self, config, **kwargs):
+            pass
+
+        def __call__(self, image, mask, **kwargs):
+            return {
+                "glb": cube.copy(),
+                "rotation": np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+                "translation": np.asarray([[0.0, 0.0, 5.0]]),
+                "scale": np.asarray([[1.0, 1.0, 1.0]]),
+            }
+
+    _, failures = reconstruct_route(
+        run_dir,
+        ReconstructConfig(
+            sam3d_config=str(tmp_path / "pipeline.yaml"), fit_mode="none"
+        ),
+        inference_factory=FakeInference,
+        image_loader=lambda path: np.asarray(Image.open(path).convert("RGB")),
+    )
+
+    assert failures == 1
+    result = json.loads((run_dir / "tracks.json").read_text())["tracks"][0]
+    assert result["status"] == "failed_placement"
+    assert (
+        result["reconstruction_attempts"][0]["placement_validation"]["accepted"]
+        is False
+    )
 
 
 def test_reconstruct_skips_unconfirmed_tracks(tmp_path):
@@ -347,9 +661,7 @@ def test_reconstruct_prefers_range_filtered_points(tmp_path, monkeypatch):
     document = json.loads((run_dir / "tracks.json").read_text())
     track = document["tracks"][0]
     track["range_gate"] = {"eligible": True, "max_mesh_range_m": 30.0}
-    track["reconstruction_points"] = (
-        "tracks/track-000001/reconstruction-points.npz"
-    )
+    track["reconstruction_points"] = "tracks/track-000001/reconstruction-points.npz"
     track["reconstruction_centroid_world"] = [7.0, 0.0, 0.0]
     atomic_write_json(run_dir / "tracks.json", document)
     captured = {}
@@ -359,10 +671,18 @@ def test_reconstruct_prefers_range_filtered_points(tmp_path, monkeypatch):
         return initial_transform, {"accepted": True}
 
     monkeypatch.setattr(
-        "sam3_route.reconstruct.load_lidar_fit_views", lambda *args, **kwargs: [object()]
+        "sam3_route.reconstruct.load_lidar_fit_views",
+        lambda *args, **kwargs: [
+            type("View", (), {"observation_id": "frame-000001-p000-i000"})(),
+            type("View", (), {"observation_id": "other-view"})(),
+        ],
     )
     monkeypatch.setattr(
         "sam3_route.reconstruct.refine_mesh_with_lidar_rays", fake_refine
+    )
+    monkeypatch.setattr(
+        "sam3_route.reconstruct.validate_mesh_placement",
+        lambda *args, **kwargs: {"accepted": True},
     )
 
     class FakeInference:

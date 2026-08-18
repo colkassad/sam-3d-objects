@@ -70,9 +70,7 @@ def _track(
 ):
     observation = _observation(identifier, scan, support_center)
     observation["prompt"] = prompt
-    mesh_path = _write_track_mesh(
-        run_dir, identifier, mesh_center, yaw_deg=yaw_deg
-    )
+    mesh_path = _write_track_mesh(run_dir, identifier, mesh_center, yaw_deg=yaw_deg)
     transform = trimesh.transformations.rotation_matrix(
         np.radians(yaw_deg), [0.0, 0.0, 1.0]
     )
@@ -130,7 +128,7 @@ def _write_run(run_dir, tracks):
     )
 
 
-def test_scene_suppresses_bad_overlap_but_preserves_individual_glb(tmp_path):
+def test_scene_keeps_overlaps_and_reports_conflicts(tmp_path):
     run_dir = tmp_path / "run"
     good = _track(run_dir, "track-good", [0, 0, 0], [0, 0, 0], 0.5)
     angled = _track(run_dir, "track-angled", [0.25, 0, 0], [4, 0, 0], 4.0)
@@ -145,10 +143,19 @@ def test_scene_suppresses_bad_overlap_but_preserves_individual_glb(tmp_path):
 
     document = json.loads((run_dir / "scene.json").read_text())
     kept = {value["track_id"] for value in document["meshes"]}
-    assert kept == {"track-good", "track-neighbor", "track-elevated", "track-bus"}
-    assert document["suppressed_meshes"][0]["track_id"] == "track-angled"
-    assert document["suppressed_meshes"][0]["winner_track_id"] == "track-good"
-    assert document["suppressed_meshes"][0]["reasons"] == ["world_mesh_overlap"]
+    assert kept == {
+        "track-good",
+        "track-angled",
+        "track-neighbor",
+        "track-elevated",
+        "track-bus",
+    }
+    assert document["suppressed_meshes"] == []
+    assert any(
+        {value["first_track_id"], value["second_track_id"]}
+        == {"track-good", "track-angled"}
+        for value in document["mesh_conflicts"]
+    )
     assert (run_dir / "meshes" / "track-angled.glb").is_file()
     saved_tracks = json.loads((run_dir / "tracks.json").read_text())["tracks"]
     assert [value["status"] for value in saved_tracks] == [
@@ -159,10 +166,10 @@ def test_scene_suppresses_bad_overlap_but_preserves_individual_glb(tmp_path):
         "ok",
     ]
     composed = trimesh.load_scene(output)
-    assert len(composed.graph.nodes_geometry) == 4
+    assert len(composed.graph.nodes_geometry) == 5
 
 
-def test_scene_suppresses_yosemite_like_iou_when_containment_is_below_threshold(
+def test_scene_reports_yosemite_like_iou_when_containment_is_below_threshold(
     tmp_path,
 ):
     run_dir = tmp_path / "yosemite-overlap"
@@ -183,50 +190,43 @@ def test_scene_suppresses_yosemite_like_iou_when_containment_is_below_threshold(
     document = json.loads((run_dir / "scene.json").read_text())
     assert {value["track_id"] for value in document["meshes"]} == {
         "track-000026",
+        "track-000028",
         "track-neighbor",
     }
-    suppression = document["suppressed_meshes"][0]
-    assert suppression["loser_track_id"] == "track-000028"
-    assert suppression["winner_track_id"] == "track-000026"
-    assert suppression["reasons"] == ["world_mesh_overlap"]
-    metrics = suppression["mesh_overlap"]
+    conflict = next(
+        value
+        for value in document["mesh_conflicts"]
+        if {value["first_track_id"], value["second_track_id"]}
+        == {"track-000026", "track-000028"}
+    )
+    metrics = conflict["mesh_overlap"]
     assert metrics["footprint_iou"] >= 0.35
     assert metrics["footprint_containment"] < 0.75
     assert metrics["vertical_containment"] >= 0.50
 
 
-def test_scene_uses_duplicate_support_when_final_meshes_do_not_overlap(tmp_path):
+def test_scene_omits_track_already_marked_duplicate(tmp_path):
     run_dir = tmp_path / "support-run"
     strong = _track(run_dir, "track-strong", [0, 0, 0], [2, 2, 0], 0.4, scan=1)
     weak = _track(run_dir, "track-weak", [20, 0, 0], [2.2, 2, 0], 3.0, scan=1)
+    weak["status"] = "duplicate_skipped"
+    weak["duplicate_of"] = "track-strong"
     _write_run(run_dir, [weak, strong])
 
     compose_scene(run_dir, overwrite=True)
 
     document = json.loads((run_dir / "scene.json").read_text())
     assert [value["track_id"] for value in document["meshes"]] == ["track-strong"]
-    suppression = document["suppressed_meshes"][0]
-    assert suppression["reasons"] == ["duplicate_track_support"]
-    assert suppression["track_support"]["median_aabb_containment"] > 0.2
+    assert document["suppressed_meshes"] == []
 
 
-def test_yosemite_overlap_regression_omits_observed_lower_quality_pairs(tmp_path):
+def test_yosemite_overlap_regression_keeps_spatially_distinct_tracks(tmp_path):
     run_dir = tmp_path / "yosemite-regression"
-    track_000008 = _track(
-        run_dir, "track-000008", [0, 0, 0], [10, 0, 0], 1.236
-    )
-    track_000006 = _track(
-        run_dir, "track-000006", [0.2, 0, 0], [15, 0, 0], 8.269
-    )
-    track_000024 = _track(
-        run_dir, "track-000024", [12, 0, 0], [20, 0, 0], 0.675
-    )
-    track_000026 = _track(
-        run_dir, "track-000026", [12.25, 0, 0], [25, 0, 0], 0.942
-    )
-    track_000019 = _track(
-        run_dir, "track-000019", [25, 0, 0], [30, 0, 0], 1.5
-    )
+    track_000008 = _track(run_dir, "track-000008", [0, 0, 0], [10, 0, 0], 1.236)
+    track_000006 = _track(run_dir, "track-000006", [0.2, 0, 0], [15, 0, 0], 8.269)
+    track_000024 = _track(run_dir, "track-000024", [12, 0, 0], [20, 0, 0], 0.675)
+    track_000026 = _track(run_dir, "track-000026", [12.25, 0, 0], [25, 0, 0], 0.942)
+    track_000019 = _track(run_dir, "track-000019", [25, 0, 0], [30, 0, 0], 1.5)
     _write_run(
         run_dir,
         [
@@ -242,20 +242,21 @@ def test_yosemite_overlap_regression_omits_observed_lower_quality_pairs(tmp_path
 
     document = json.loads((run_dir / "scene.json").read_text())
     assert {value["track_id"] for value in document["meshes"]} == {
+        "track-000006",
         "track-000008",
         "track-000019",
         "track-000024",
+        "track-000026",
     }
-    assert {
-        (value["track_id"], value["winner_track_id"])
-        for value in document["suppressed_meshes"]
-    } == {
-        ("track-000006", "track-000008"),
-        ("track-000026", "track-000024"),
+    conflict_pairs = {
+        frozenset((value["first_track_id"], value["second_track_id"]))
+        for value in document["mesh_conflicts"]
     }
+    assert frozenset(("track-000006", "track-000008")) in conflict_pairs
+    assert frozenset(("track-000026", "track-000024")) in conflict_pairs
 
 
-def test_scene_greedy_suppression_does_not_transitively_remove_neighbor(tmp_path):
+def test_scene_reports_overlap_chain_without_removing_members(tmp_path):
     run_dir = tmp_path / "chain-run"
     first = _track(run_dir, "track-a", [0, 0, 0], [0, 10, 0], 0.2)
     middle = _track(run_dir, "track-b", [2, 0, 0], [4, 10, 0], 1.0)
@@ -268,19 +269,18 @@ def test_scene_greedy_suppression_does_not_transitively_remove_neighbor(tmp_path
     document = json.loads((run_dir / "scene.json").read_text())
     assert {value["track_id"] for value in document["meshes"]} == {
         "track-a",
+        "track-b",
         "track-c",
     }
-    assert [value["track_id"] for value in document["suppressed_meshes"]] == [
-        "track-b"
-    ]
+    assert len(document["mesh_conflicts"]) == 2
 
 
-def test_scene_suppression_can_be_disabled_and_is_resumable(tmp_path):
+def test_scene_conflict_reporting_is_resumable(tmp_path):
     run_dir = tmp_path / "disabled-run"
     first = _track(run_dir, "track-a", [0, 0, 0], [0, 0, 0], 0.2)
     second = _track(run_dir, "track-b", [0, 0, 0], [5, 0, 0], 2.0)
     _write_run(run_dir, [first, second])
-    config = SceneConfig(suppress_overlapping_meshes=False)
+    config = SceneConfig()
 
     first_output = compose_scene(run_dir, config, overwrite=True)
     second_output = compose_scene(run_dir, config)
@@ -290,7 +290,7 @@ def test_scene_suppression_can_be_disabled_and_is_resumable(tmp_path):
     assert len(document["meshes"]) == 2
     assert document["suppressed_meshes"] == []
     with pytest.raises(RuntimeError, match="configuration changed"):
-        compose_scene(run_dir, SceneConfig())
+        compose_scene(run_dir, SceneConfig(mesh_overlap_min_iou=0.40))
 
 
 def test_scene_failure_removes_stale_outputs_and_marks_stage_failed(tmp_path):
