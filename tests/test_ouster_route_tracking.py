@@ -106,6 +106,14 @@ def test_constant_velocity_track_is_marked_dynamic():
     assert speed == 2.0
 
 
+def test_no_reliable_observations_cannot_confirm_motion():
+    motion = _motion_record([], 0.5)
+
+    assert motion.state == "unconfirmed"
+    assert motion.position_uncertainty_m == 0.5
+    assert "no observations" in motion.reason
+
+
 def test_two_observations_can_establish_motion():
     track = [
         make_observation("a", 1, 0.0, timestamp=1_000_000_000),
@@ -415,6 +423,13 @@ def test_track_uses_only_qualifying_view_and_points_for_reconstruction(tmp_path)
 
     assert track["status"] == "pending"
     assert track["selected_observation_id"] == "near"
+    assert track["quality_gate"] == {
+        "min_inlier_fraction": 0.2,
+        "accepted_observation_count": 2,
+        "accepted_observation_ids": ["near", "far"],
+        "rejected_observation_count": 0,
+        "rejected_observation_ids": [],
+    }
     assert track["range_gate"] == {
         "max_mesh_range_m": 30.0,
         "minimum_observation_range_m": 30.0,
@@ -428,6 +443,77 @@ def test_track_uses_only_qualifying_view_and_points_for_reconstruction(tmp_path)
     with np.load(run_dir / track["reconstruction_points"]) as values:
         np.testing.assert_allclose(values["points_world"][:, 0], 0.0)
     np.testing.assert_allclose(track["reconstruction_centroid_world"], near.centroid)
+
+
+def test_low_inlier_depth_leaks_cannot_confirm_or_source_reconstruction(tmp_path):
+    run_dir = tmp_path / "run"
+    observations_dir = run_dir / "observations"
+    observations_dir.mkdir(parents=True)
+    first_leak = make_observation(
+        "large-mask-leak-a", 1, 5.0, timestamp=1_000_000_000
+    )
+    second_leak = make_observation(
+        "large-mask-leak-b", 2, 5.1, timestamp=3_000_000_000
+    )
+    reliable = make_observation(
+        "credible-partial-view", 3, 5.0, timestamp=5_000_000_000
+    )
+    first_leak.score = 0.98
+    first_leak.mask_area_px = 20_000
+    first_leak.inlier_fraction = 0.0011
+    second_leak.score = 0.97
+    second_leak.mask_area_px = 20_000
+    second_leak.inlier_fraction = 0.0022
+    reliable.score = 0.75
+    reliable.mask_area_px = 350
+    reliable.inlier_fraction = 0.72
+    keyframes = []
+    for index, value in enumerate((first_leak, second_leak, reliable)):
+        frame_dir = run_dir / "frames" / value.frame_id
+        frame_dir.mkdir(parents=True)
+        Image.new("RGB", (4, 4)).save(frame_dir / "rgb.png")
+        Image.new("L", (4, 4), 255).save(observations_dir / f"{value.id}.png")
+        points = np.asarray(
+            [[5.0, index, 0.0], [5.1, index, 0.0], [5.0, index, 0.1]],
+            dtype=np.float32,
+        )
+        np.savez_compressed(observations_dir / f"{value.id}.npz", points_world=points)
+        value.mask_path = f"observations/{value.id}.png"
+        value.points_path = f"observations/{value.id}.npz"
+        keyframes.append(
+            {"id": value.frame_id, "rgb": f"frames/{value.frame_id}/rgb.png"}
+        )
+    atomic_write_json(
+        run_dir / "route-manifest.json",
+        {
+            "schema": ROUTE_MANIFEST_SCHEMA,
+            "stages": {},
+            "keyframes": keyframes,
+        },
+    )
+
+    track = _track_document(
+        run_dir,
+        "track-000028",
+        [first_leak, second_leak, reliable],
+        dynamic_min_speed_mps=0.5,
+        max_mesh_range_m=30.0,
+    )
+
+    assert track["motion_state"] == "unconfirmed"
+    assert track["status"] == "unconfirmed_skipped"
+    assert track["selected_observation_id"] == reliable.id
+    assert len(track["observations"]) == 3
+    assert track["quality_gate"] == {
+        "min_inlier_fraction": 0.2,
+        "accepted_observation_count": 1,
+        "accepted_observation_ids": [reliable.id],
+        "rejected_observation_count": 2,
+        "rejected_observation_ids": [first_leak.id, second_leak.id],
+    }
+    with np.load(run_dir / track["reconstruction_points"]) as values:
+        assert len(values["points_world"]) == 3
+        np.testing.assert_allclose(values["points_world"][:, 1], 2.0)
 
 
 @pytest.mark.skipif(

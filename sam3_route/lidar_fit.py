@@ -516,8 +516,11 @@ def refine_mesh_with_lidar_rays(
         base_axis[0] * target_axis[1] - base_axis[1] * target_axis[0],
         base_axis[:2] @ target_axis[:2],
     )
+    bounded_heading_delta = float(
+        np.clip(heading_delta, bounds[3][0], bounds[3][1])
+    )
     heading_seed = zero.copy()
-    heading_seed[3] = float(np.clip(heading_delta, bounds[3][0], bounds[3][1]))
+    heading_seed[3] = bounded_heading_delta
     projected = base_world @ support["axis_world"]
     mesh_near = float(np.quantile(projected, 0.02 if support["near_is_low"] else 0.98))
     near_seed = heading_seed.copy()
@@ -555,6 +558,7 @@ def refine_mesh_with_lidar_rays(
     yaw_polish: dict[str, Any] = {
         "performed": False,
         "target_delta_deg": math.degrees(heading_delta),
+        "bounded_target_delta_deg": math.degrees(bounded_heading_delta),
         "informative_observation_ids": [value.observation_id for value in heading_views],
     }
     if heading_views:
@@ -562,14 +566,25 @@ def refine_mesh_with_lidar_rays(
         polish_before, _ = evaluate(
             best_parameters,
             active_views=heading_views,
-            heading_target=heading_delta,
+            heading_target=bounded_heading_delta,
             global_constraints=False,
         )
-        minimum_yaw = max(bounds[3][0], heading_delta - math.radians(5.0))
-        maximum_yaw = min(bounds[3][1], heading_delta + math.radians(5.0))
+        minimum_yaw = max(
+            bounds[3][0], bounded_heading_delta - math.radians(5.0)
+        )
+        maximum_yaw = min(
+            bounds[3][1], bounded_heading_delta + math.radians(5.0)
+        )
         yaw_values = np.linspace(minimum_yaw, maximum_yaw, polish_grid_count)
         yaw_values = np.unique(
-            np.append(yaw_values, [best_parameters[3], heading_delta, 0.0])
+            np.clip(
+                np.append(
+                    yaw_values,
+                    [best_parameters[3], bounded_heading_delta, 0.0],
+                ),
+                bounds[3][0],
+                bounds[3][1],
+            )
         )
         polished = best_parameters.copy()
         polished_score = math.inf
@@ -582,7 +597,7 @@ def refine_mesh_with_lidar_rays(
                 score, _ = evaluate(
                     candidate_parameters,
                     active_views=heading_views,
-                    heading_target=heading_delta,
+                    heading_target=bounded_heading_delta,
                     global_constraints=False,
                 )
                 evaluations += 1
@@ -610,7 +625,7 @@ def refine_mesh_with_lidar_rays(
                 score, _ = evaluate(
                     candidate_parameters,
                     active_views=heading_views,
-                    heading_target=heading_delta,
+                    heading_target=bounded_heading_delta,
                     global_constraints=False,
                 )
                 evaluations += 1
@@ -662,10 +677,17 @@ def refine_mesh_with_lidar_rays(
         if baseline_score > 1e-9
         else 0.0
     )
+    bounds_satisfied = bool(
+        all(
+            lower - 1e-9 <= float(value) <= upper + 1e-9
+            for value, (lower, upper) in zip(best_parameters, bounds)
+        )
+    )
     accepted = bool(
         np.all(np.isfinite(candidate))
         and improvement >= 0.05
         and per_view_ok
+        and bounds_satisfied
     )
     report = {
         "method": "multi_view_lidar_raycast",
@@ -684,6 +706,7 @@ def refine_mesh_with_lidar_rays(
             "max_rotation_deg": max_rotation_deg,
             "max_axis_scale_change": max_axis_scale_change,
             "max_evaluations": max_evaluations,
+            "satisfied": bounds_satisfied,
         },
         "evaluations": evaluations,
         "optimizer_messages": optimizer_messages,

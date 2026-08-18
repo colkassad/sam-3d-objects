@@ -37,6 +37,7 @@ from .lidar_fit import (
     world_rays_from_frame,
 )
 from .scene import SceneConfig, compose_scene
+from .tracking import MIN_RECONSTRUCTION_INLIER_FRACTION
 
 
 @dataclass(frozen=True)
@@ -412,7 +413,10 @@ def load_lidar_fit_views(
     for observation in track["observations"]:
         if eligible is not None and observation["id"] not in eligible:
             continue
-        if float(observation.get("inlier_fraction", 0.0)) < 0.20:
+        if (
+            float(observation.get("inlier_fraction", 0.0))
+            < MIN_RECONSTRUCTION_INLIER_FRACTION
+        ):
             continue
         frame = frames.get(observation["frame_id"])
         if frame is None:
