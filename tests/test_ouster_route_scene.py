@@ -39,9 +39,13 @@ def _observation(identifier, scan, centroid):
     }
 
 
-def _write_track_mesh(run_dir: Path, identifier: str, mesh_center) -> str:
+def _write_track_mesh(
+    run_dir: Path, identifier: str, mesh_center, *, yaw_deg: float = 0.0
+) -> str:
     mesh = trimesh.creation.box(extents=(4.0, 2.0, 1.5))
-    transform = np.eye(4)
+    transform = trimesh.transformations.rotation_matrix(
+        np.radians(yaw_deg), [0.0, 0.0, 1.0]
+    )
     transform[:3, 3] = mesh_center
     scene = trimesh.Scene()
     scene.add_geometry(
@@ -62,11 +66,16 @@ def _track(
     *,
     prompt="car",
     scan=1,
+    yaw_deg=0.0,
 ):
     observation = _observation(identifier, scan, support_center)
     observation["prompt"] = prompt
-    mesh_path = _write_track_mesh(run_dir, identifier, mesh_center)
-    transform = np.eye(4)
+    mesh_path = _write_track_mesh(
+        run_dir, identifier, mesh_center, yaw_deg=yaw_deg
+    )
+    transform = trimesh.transformations.rotation_matrix(
+        np.radians(yaw_deg), [0.0, 0.0, 1.0]
+    )
     transform[:3, 3] = mesh_center
     return {
         "id": identifier,
@@ -151,6 +160,39 @@ def test_scene_suppresses_bad_overlap_but_preserves_individual_glb(tmp_path):
     ]
     composed = trimesh.load_scene(output)
     assert len(composed.graph.nodes_geometry) == 4
+
+
+def test_scene_suppresses_yosemite_like_iou_when_containment_is_below_threshold(
+    tmp_path,
+):
+    run_dir = tmp_path / "yosemite-overlap"
+    good = _track(run_dir, "track-000026", [0, 0, 0], [0, 10, 0], 0.7)
+    angled = _track(
+        run_dir,
+        "track-000028",
+        [1, 0, 0],
+        [5, 10, 0],
+        4.4,
+        yaw_deg=45.0,
+    )
+    neighbor = _track(run_dir, "track-neighbor", [6, 0, 0], [10, 10, 0], 0.8)
+    _write_run(run_dir, [angled, neighbor, good])
+
+    compose_scene(run_dir, SceneConfig(), overwrite=True)
+
+    document = json.loads((run_dir / "scene.json").read_text())
+    assert {value["track_id"] for value in document["meshes"]} == {
+        "track-000026",
+        "track-neighbor",
+    }
+    suppression = document["suppressed_meshes"][0]
+    assert suppression["loser_track_id"] == "track-000028"
+    assert suppression["winner_track_id"] == "track-000026"
+    assert suppression["reasons"] == ["world_mesh_overlap"]
+    metrics = suppression["mesh_overlap"]
+    assert metrics["footprint_iou"] >= 0.35
+    assert metrics["footprint_containment"] < 0.75
+    assert metrics["vertical_containment"] >= 0.50
 
 
 def test_scene_uses_duplicate_support_when_final_meshes_do_not_overlap(tmp_path):

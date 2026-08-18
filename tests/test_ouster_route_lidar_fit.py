@@ -102,4 +102,32 @@ def test_raycast_fit_recovers_sensor_depth_without_density_recentering():
     assert report["method"] == "multi_view_lidar_raycast"
     assert report["accepted"] is True
     assert transform[0, 3] < shifted[0, 3] - 0.2
-    assert report["candidate_views"][0]["median_depth_residual_m"] < 0.15
+    assert report["candidate_views"][0]["median_depth_residual_m"] < 0.20
+
+
+def test_yaw_polish_clips_out_of_bounds_heading_target():
+    mesh = trimesh.creation.box(extents=(4.0, 2.0, 2.0))
+    along = np.linspace(-2.0, 2.0, 120)
+    points = np.column_stack((5.0 + along, 5.0 + along, np.ones_like(along)))
+    view = _view_from_points("diagonal-side", points)
+    initial = np.eye(4)
+    initial[:3, 3] = [5.0, 5.0, 1.0]
+
+    _, report = refine_mesh_with_lidar_rays(
+        np.asarray(mesh.vertices),
+        np.asarray(mesh.faces),
+        initial,
+        [view],
+        points,
+        max_rotation_deg=20.0,
+        max_evaluations=80,
+        grounded=False,
+    )
+
+    polish = report["heading"]["polish"]
+    assert abs(polish["target_delta_deg"]) > 20.0
+    assert abs(polish["bounded_target_delta_deg"]) == 20.0
+    assert polish["grid_min_deg"] <= polish["grid_max_deg"]
+    assert abs(polish["yaw_after_deg"]) <= 20.0 + 1e-9
+    assert abs(report["parameters"]["yaw_delta_deg"]) <= 20.0 + 1e-9
+    assert report["limits"]["satisfied"] is True

@@ -30,6 +30,7 @@ from .geometry import points_from_range, transform_pointmap_per_column
 DEFAULT_DUPLICATE_TRACK_MAX_CENTROID_M = 1.0
 DEFAULT_DUPLICATE_TRACK_MIN_SHARED_FRACTION = 0.50
 DEFAULT_DUPLICATE_TRACK_MIN_CONTAINMENT = 0.30
+MIN_RECONSTRUCTION_INLIER_FRACTION = 0.20
 
 
 @dataclass(frozen=True)
@@ -565,6 +566,14 @@ def deduplicate_frame_observations(
 
 def _motion_record(track: Sequence[Observation], minimum_speed: float) -> MotionRecord:
     values = sorted(track, key=lambda value: (value.timestamp_ns or -1, value.id))
+    if not values:
+        return MotionRecord(
+            "unconfirmed",
+            0.0,
+            0.0,
+            0.5,
+            "no observations are available to establish a static world position",
+        )
     ranges = np.asarray([value.median_range_m for value in values], dtype=np.float64)
     diagonals = np.asarray([np.linalg.norm(value.extents) for value in values])
     uncertainty = float(
@@ -736,6 +745,18 @@ def _range_eligible_observations(
     if max_mesh_range_m is None:
         return list(values)
     return [value for value in values if value.median_range_m <= max_mesh_range_m]
+
+
+def _reconstruction_reliable_observations(
+    values: Sequence[Observation],
+) -> list[Observation]:
+    """Keep depth components that explain a meaningful part of their SAM mask."""
+
+    return [
+        value
+        for value in values
+        if value.inlier_fraction >= MIN_RECONSTRUCTION_INLIER_FRACTION
+    ]
 
 
 def _track_status(motion_state: str, has_range_eligible_observation: bool) -> str:
@@ -922,10 +943,12 @@ def _track_document(
     dynamic_min_speed_mps: float,
     max_mesh_range_m: Optional[float],
 ) -> dict[str, Any]:
-    overall_selected = _select_observation(values)
-    range_eligible = _range_eligible_observations(values, max_mesh_range_m)
+    reliable = _reconstruction_reliable_observations(values)
+    reliable_ids = {value.id for value in reliable}
+    overall_selected = _select_observation(reliable or values)
+    range_eligible = _range_eligible_observations(reliable, max_mesh_range_m)
     selected = _select_observation(range_eligible) if range_eligible else overall_selected
-    motion = _motion_record(values, dynamic_min_speed_mps)
+    motion = _motion_record(reliable, dynamic_min_speed_mps)
     combined = _combine_observation_points(run_dir, values)
     track_dir = run_dir / "tracks" / track_id
     track_dir.mkdir(parents=True, exist_ok=True)
@@ -951,9 +974,15 @@ def _track_document(
     shutil.copy2(mask_source, mask_target)
     fused_centroid = np.median(np.asarray([value.centroid for value in values]), axis=0)
     status = _track_status(motion.state, bool(range_eligible))
-    minimum_range = min(value.median_range_m for value in values)
+    minimum_range = min(
+        value.median_range_m for value in (reliable if reliable else values)
+    )
     if max_mesh_range_m is None:
         range_reason = "mesh range limit is disabled"
+    elif not reliable:
+        range_reason = (
+            "no observation meets the reconstruction inlier-fraction quality gate"
+        )
     elif range_eligible:
         range_reason = (
             f"{len(range_eligible)} observation(s) are at or below "
@@ -975,6 +1004,15 @@ def _track_document(
         "centroid_world": fused_centroid.tolist(),
         "observations": [asdict(value) for value in values],
         "selected_observation_id": selected.id,
+        "quality_gate": {
+            "min_inlier_fraction": MIN_RECONSTRUCTION_INLIER_FRACTION,
+            "accepted_observation_count": len(reliable),
+            "accepted_observation_ids": [value.id for value in reliable],
+            "rejected_observation_count": len(values) - len(reliable),
+            "rejected_observation_ids": [
+                value.id for value in values if value.id not in reliable_ids
+            ],
+        },
         "points": relative_artifact(run_dir, points_path),
         "reconstruction_points": (
             relative_artifact(run_dir, reconstruction_points_path)

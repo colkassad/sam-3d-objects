@@ -402,9 +402,11 @@ def compose_scene(
                         resolution_m=config.mesh_overlap_resolution_m,
                     )
                     mesh_conflict = (
-                        overlap["footprint_iou"] >= config.mesh_overlap_min_iou
-                        and overlap["footprint_containment"]
-                        >= config.mesh_overlap_min_containment
+                        (
+                            overlap["footprint_iou"] >= config.mesh_overlap_min_iou
+                            or overlap["footprint_containment"]
+                            >= config.mesh_overlap_min_containment
+                        )
                         and overlap["vertical_containment"]
                         >= config.mesh_vertical_overlap_min
                     )
