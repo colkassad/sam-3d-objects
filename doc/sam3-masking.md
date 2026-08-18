@@ -60,18 +60,31 @@ sibling `sam3-masking` environment automatically; alternatively, set
 ```bash
 python scripts/demo_prompt_to_mesh.py \
   --image /path/to/image.jpg \
-  --prompt "parked car"
+  --prompts "parked car"
 ```
 
-Repeat `--prompt` to find multiple concepts and select an explicit destination:
+Use a comma-separated prompt list to find multiple concepts and select an explicit destination:
 
 ```bash
 python scripts/demo_prompt_to_mesh.py \
   --image /path/to/image.jpg \
-  --prompt "parked car" \
-  --prompt "traffic cone" \
+  --prompts "parked car,traffic cone" \
   --output-dir outputs/demo
 ```
+
+Related queries can be collapsed into one canonical output category while
+retaining the raw query in each mask record:
+
+```bash
+sam3-mask --model-dir checkpoints/sam3-hf --image street.png \
+  --output-dir outputs/street \
+  --prompts "car,truck,bus" \
+  --synonyms "vehicle:car,truck,bus"
+```
+
+Synonym members must appear in `--prompts`. Specifications containing
+semicolons must be shell-quoted. Overlapping alias detections are represented
+by the highest-scoring mask; spatially distinct instances remain independent.
 
 Without `--output-dir`, results are written to
 `outputs/sam3-demo/<image-stem>/`. Each result contains
@@ -84,8 +97,7 @@ detected instance, and one successful GLB under `meshes/` per instance.
 micromamba run -n sam3-masking sam3-mask \
   --model-dir checkpoints/sam3-hf \
   --image notebook/images/edited_id14_032207032-scenes-traffic-rome-12-12_processed/image.png \
-  --prompt "parked car" \
-  --prompt "traffic sign" \
+  --prompts "parked car,traffic sign" \
   --output-dir outputs/route-frame-0001 \
   --source-id route-frame-0001 \
   --profile-memory
@@ -125,8 +137,7 @@ sam3d-prompt-to-mesh \
   --sam3-model-dir checkpoints/sam3-hf \
   --sam3d-config checkpoints/hf/pipeline.yaml \
   --image notebook/images/edited_id14_032207032-scenes-traffic-rome-12-12_processed/image.png \
-  --prompt "parked car" \
-  --prompt "traffic sign" \
+  --prompts "parked car,traffic sign" \
   --output-dir outputs/route-frame-0001 \
   --memory-profile low_vram
 ```

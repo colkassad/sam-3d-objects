@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,16 +18,20 @@ from sam3_route.tracking import (
     Observation,
     SegmentConfig,
     _dynamic_record,
+    _evidence_gate,
     _motion_record,
     _range_eligible_observations,
-    _select_observation,
+    _rank_observations,
     _select_consistent_depth_candidates,
+    _select_observation,
+    _select_recovery_frame_ids,
     _track_document,
     _track_status,
     associate_observations,
     build_tracks,
     dominant_depth_component,
     duplicate_track_evidence,
+    segment_route,
     suppress_duplicate_track_documents,
 )
 
@@ -209,6 +214,149 @@ def test_clean_candidate_beats_a_larger_truncated_depth_incoherent_mask():
     assert clean.quality > dirty.quality
 
 
+def test_view_ranking_prefers_complete_vertical_view_but_not_panorama_seam():
+    seam = make_observation("seam", 1, 0.0)
+    seam.score = 0.80
+    seam.border_touch = False
+    seam.vertical_border_touch = False
+    seam.vertical_edge_clearance = 0.8
+    truncated = make_observation("top-edge", 2, 0.0)
+    truncated.score = 0.99
+    truncated.border_touch = True
+    truncated.vertical_border_touch = True
+    truncated.vertical_edge_clearance = 0.0
+
+    ranked = _rank_observations([truncated, seam])
+
+    assert [value.id for value in ranked] == ["seam", "top-edge"]
+    assert seam.selection_rank == 1
+    assert set(seam.quality_components) == {
+        "sam_score",
+        "inlier_fraction",
+        "valid_depth_fraction",
+        "relative_mask_area",
+        "track_consistency",
+        "vertical_edge_clearance",
+    }
+
+
+def test_recovery_selection_deduplicates_frames_and_caps_each_seed_per_round():
+    manifest = {
+        "recovery_frames": [
+            {"id": f"frame-{index}", "scan_index": index, "mask_manifest": None}
+            for index in (1, 2, 4, 5, 7, 8)
+        ]
+    }
+    singleton = {
+        "id": "track-a",
+        "motion_state": "unconfirmed",
+        "status": "unconfirmed_skipped",
+        "observations": [{"scan_index": 3}],
+    }
+    nearby = {
+        "id": "track-b",
+        "motion_state": "unconfirmed",
+        "status": "unconfirmed_skipped",
+        "observations": [{"scan_index": 6}],
+    }
+
+    first = _select_recovery_frame_ids(manifest, {"tracks": [singleton, nearby]})
+    assert first == ["frame-2", "frame-4", "frame-5", "frame-7"]
+    for frame in manifest["recovery_frames"]:
+        if frame["id"] in first:
+            frame["mask_manifest"] = "done"
+    second = _select_recovery_frame_ids(manifest, {"tracks": [singleton, nearby]})
+    assert second == ["frame-1", "frame-8"]
+
+    dynamic = dict(singleton, motion_state="dynamic", status="evidence_skipped")
+    assert _select_recovery_frame_ids(manifest, {"tracks": [dynamic]}) == [
+        "frame-1",
+        "frame-8",
+    ]
+
+
+def test_segment_route_recovers_singleton_with_neighbor_frames(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    manifest_path = run_dir / "route-manifest.json"
+    atomic_write_json(
+        manifest_path,
+        {
+            "schema": ROUTE_MANIFEST_SCHEMA,
+            "stages": {"extract": {"status": "complete"}},
+            "keyframes": [{"id": "frame-5", "scan_index": 5, "mask_manifest": None}],
+            "recovery_frames": [
+                {"id": "frame-4", "scan_index": 4, "mask_manifest": None},
+                {"id": "frame-6", "scan_index": 6, "mask_manifest": None},
+            ],
+            "prompts": [],
+            "tracks": None,
+            "outputs": {},
+        },
+    )
+    commands = []
+
+    def fake_subprocess(command, check):
+        commands.append(command)
+        selected = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--frame-id"
+        ]
+        document = json.loads(manifest_path.read_text())
+        for frame in document["keyframes"] + document["recovery_frames"]:
+            if frame["id"] in selected:
+                frame["mask_manifest"] = f"frames/{frame['id']}/manifest.json"
+        atomic_write_json(manifest_path, document)
+        return SimpleNamespace(returncode=0)
+
+    def fake_build_tracks(run_path, manifest, config):
+        recovered = any(
+            frame.get("mask_manifest") for frame in manifest["recovery_frames"]
+        )
+        observations = [{"id": "base", "scan_index": 5}]
+        if recovered:
+            observations.extend(
+                [{"id": "before", "scan_index": 4}, {"id": "after", "scan_index": 6}]
+            )
+        track = {
+            "id": "track-1",
+            "motion_state": "confirmed_static" if recovered else "unconfirmed",
+            "status": "pending" if recovered else "unconfirmed_skipped",
+            "observations": observations,
+        }
+        path = run_path / "tracks.json"
+        atomic_write_json(
+            path,
+            {"schema": "ouster-route-tracks/v1", "tracks": [track]},
+        )
+        return path
+
+    monkeypatch.setattr("sam3_route.tracking.build_tracks", fake_build_tracks)
+    config = SegmentConfig(
+        prompts=("car",),
+        sam3_model_dir="model",
+        sam3_executable="sam3-mask-route",
+    )
+
+    tracks_path = segment_route(run_dir, config, subprocess_run=fake_subprocess)
+
+    assert len(commands) == 2
+    assert [
+        commands[1][index + 1]
+        for index, value in enumerate(commands[1])
+        if value == "--frame-id"
+    ] == ["frame-4", "frame-6"]
+    assert json.loads(tracks_path.read_text())["tracks"][0]["motion_state"] == (
+        "confirmed_static"
+    )
+    result_manifest = json.loads(manifest_path.read_text())
+    assert result_manifest["sam3_recovery"]["rounds"][0]["frame_ids"] == [
+        "frame-4",
+        "frame-6",
+    ]
+
+
 @pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
 def test_mesh_range_must_be_positive_and_finite(value):
     with pytest.raises(ValueError, match="max_mesh_range_m"):
@@ -365,18 +513,42 @@ def test_mesh_range_is_inclusive():
 
 
 @pytest.mark.parametrize(
-    ("motion_state", "range_eligible", "expected"),
+    ("has_evidence", "range_eligible", "expected"),
     [
-        ("dynamic", False, "dynamic_skipped"),
-        ("unconfirmed", False, "unconfirmed_skipped"),
-        ("confirmed_static", False, "range_skipped"),
-        ("confirmed_static", True, "pending"),
+        (False, False, "evidence_skipped"),
+        (True, False, "range_skipped"),
+        (True, True, "pending"),
     ],
 )
-def test_motion_state_takes_precedence_over_range_gate(
-    motion_state, range_eligible, expected
+def test_evidence_and_range_determine_track_status(
+    has_evidence, range_eligible, expected
 ):
-    assert _track_status(motion_state, range_eligible) == expected
+    assert _track_status(has_evidence, range_eligible) == expected
+
+
+def test_evidence_gate_accepts_strong_singleton_and_repeatable_weak_views():
+    strong = make_observation("strong", 1, 0.0)
+    weak_a = make_observation("weak-a", 1, 4.0)
+    weak_b = make_observation("weak-b", 2, 4.2)
+    weak_a.inlier_fraction = 0.05
+    weak_b.inlier_fraction = 0.08
+
+    assert _evidence_gate([strong])["eligible_observation_ids"] == ["strong"]
+    weak_gate = _evidence_gate([weak_b, weak_a])
+    assert weak_gate["eligible"] is True
+    assert weak_gate["eligible_observation_ids"] == ["weak-a", "weak-b"]
+
+
+def test_evidence_gate_rejects_weak_singleton_and_excludes_spatial_outlier():
+    weak_a = make_observation("weak-a", 1, 0.0)
+    weak_b = make_observation("weak-b", 2, 0.2)
+    outlier = make_observation("weak-outlier", 3, 4.0)
+    for value in (weak_a, weak_b, outlier):
+        value.inlier_fraction = 0.05
+
+    assert _evidence_gate([weak_a])["eligible"] is False
+    gate = _evidence_gate([outlier, weak_b, weak_a])
+    assert gate["eligible_observation_ids"] == ["weak-a", "weak-b"]
 
 
 def test_track_uses_only_qualifying_view_and_points_for_reconstruction(tmp_path):
@@ -403,7 +575,9 @@ def test_track_uses_only_qualifying_view_and_points_for_reconstruction(tmp_path)
         np.savez_compressed(observations_dir / f"{value.id}.npz", points_world=points)
         value.mask_path = f"observations/{value.id}.png"
         value.points_path = f"observations/{value.id}.npz"
-        keyframes.append({"id": value.frame_id, "rgb": f"frames/{value.frame_id}/rgb.png"})
+        keyframes.append(
+            {"id": value.frame_id, "rgb": f"frames/{value.frame_id}/rgb.png"}
+        )
     atomic_write_json(
         run_dir / "route-manifest.json",
         {
@@ -449,12 +623,8 @@ def test_low_inlier_depth_leaks_cannot_confirm_or_source_reconstruction(tmp_path
     run_dir = tmp_path / "run"
     observations_dir = run_dir / "observations"
     observations_dir.mkdir(parents=True)
-    first_leak = make_observation(
-        "large-mask-leak-a", 1, 5.0, timestamp=1_000_000_000
-    )
-    second_leak = make_observation(
-        "large-mask-leak-b", 2, 5.1, timestamp=3_000_000_000
-    )
+    first_leak = make_observation("large-mask-leak-a", 1, 5.0, timestamp=1_000_000_000)
+    second_leak = make_observation("large-mask-leak-b", 2, 5.1, timestamp=3_000_000_000)
     reliable = make_observation(
         "credible-partial-view", 3, 5.0, timestamp=5_000_000_000
     )
@@ -501,7 +671,8 @@ def test_low_inlier_depth_leaks_cannot_confirm_or_source_reconstruction(tmp_path
     )
 
     assert track["motion_state"] == "unconfirmed"
-    assert track["status"] == "unconfirmed_skipped"
+    assert track["status"] == "pending"
+    assert track["motion_gate_applied"] is False
     assert track["selected_observation_id"] == reliable.id
     assert len(track["observations"]) == 3
     assert track["quality_gate"] == {
@@ -518,7 +689,9 @@ def test_low_inlier_depth_leaks_cannot_confirm_or_source_reconstruction(tmp_path
 
 @pytest.mark.skipif(
     not os.environ.get("SAM3_ROUTE_YOSEMITE_FIXTURE"),
-    reason="set SAM3_ROUTE_YOSEMITE_FIXTURE for the model-free real-artifact regression",
+    reason=(
+        "set SAM3_ROUTE_YOSEMITE_FIXTURE for the model-free real-artifact regression"
+    ),
 )
 def test_yosemite_vehicle_artifacts_yield_one_static_bus(tmp_path):
     source = Path(os.environ["SAM3_ROUTE_YOSEMITE_FIXTURE"]).resolve()

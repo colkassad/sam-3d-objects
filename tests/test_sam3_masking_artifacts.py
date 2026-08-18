@@ -73,6 +73,20 @@ def test_manifest_round_trip_preserves_boolean_mask_and_metadata(tmp_path):
     document = json.loads(manifest_path.read_text())
     assert document["schema"] == "sam3-mask-manifest/v1"
     assert document["predictions"][0]["score"] == 0.875
+    assert document["predictions"][0]["query_prompt"] == "parked car"
+
+
+def test_manifest_without_query_prompt_defaults_to_canonical_prompt(tmp_path):
+    manifest_path = write_mask_manifest(
+        MaskFrame(5, 4, (make_prediction(),)), tmp_path / "legacy"
+    )
+    document = json.loads(manifest_path.read_text())
+    document["predictions"][0].pop("query_prompt")
+    manifest_path.write_text(json.dumps(document))
+
+    loaded = load_mask_manifest(manifest_path)
+
+    assert loaded.predictions[0].query_prompt == "parked car"
 
 
 def test_manifest_rejects_mask_path_traversal(tmp_path):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
@@ -16,6 +16,7 @@ class MaskPrediction:
     score: float
     box_xyxy: Tuple[float, float, float, float]
     mask: np.ndarray
+    query_prompt: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", self.id):
@@ -36,6 +37,10 @@ class MaskPrediction:
             raise ValueError("box_xyxy must contain four finite coordinates")
         if not self.prompt.strip():
             raise ValueError("prompt must not be empty")
+        query_prompt = self.prompt if self.query_prompt is None else self.query_prompt
+        if not isinstance(query_prompt, str) or not query_prompt.strip():
+            raise ValueError("query_prompt must not be empty")
+        object.__setattr__(self, "query_prompt", query_prompt.strip())
 
 
 @dataclass(frozen=True)

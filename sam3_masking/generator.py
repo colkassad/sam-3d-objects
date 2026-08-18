@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Union
 
@@ -147,6 +148,7 @@ class Sam3MaskGenerator:
         score_threshold: float = 0.5,
         mask_threshold: float = 0.5,
         source_id: Optional[str] = None,
+        synonym_to_canonical: Optional[Mapping[str, str]] = None,
     ) -> MaskFrame:
         """Segment all instances matching each prompt in one image."""
 
@@ -197,7 +199,16 @@ class Sam3MaskGenerator:
                 )
                 predictions.extend(prompt_predictions)
 
-        predictions.sort(key=lambda prediction: prediction.score, reverse=True)
+        predictions = self._canonicalize_predictions(
+            predictions, synonym_to_canonical or {}
+        )
+        predictions.sort(
+            key=lambda prediction: (
+                -prediction.score,
+                -int(np.count_nonzero(prediction.mask)),
+                prediction.id,
+            )
+        )
 
         return MaskFrame(
             width=width,
@@ -205,6 +216,48 @@ class Sam3MaskGenerator:
             predictions=tuple(predictions),
             source_id=source_id,
         )
+
+    @staticmethod
+    def _canonicalize_predictions(
+        predictions: Sequence[MaskPrediction],
+        synonym_to_canonical: Mapping[str, str],
+    ) -> list[MaskPrediction]:
+        canonicalized = [
+            replace(
+                prediction,
+                prompt=synonym_to_canonical.get(prediction.prompt, prediction.prompt),
+                query_prompt=prediction.prompt,
+            )
+            for prediction in predictions
+        ]
+        ranked = sorted(
+            canonicalized,
+            key=lambda prediction: (
+                -prediction.score,
+                -int(np.count_nonzero(prediction.mask)),
+                prediction.id,
+            ),
+        )
+        kept: list[MaskPrediction] = []
+        for candidate in ranked:
+            duplicate = False
+            for prior in kept:
+                if candidate.prompt.casefold() != prior.prompt.casefold():
+                    continue
+                intersection = int(np.count_nonzero(candidate.mask & prior.mask))
+                if not intersection:
+                    continue
+                first_area = int(np.count_nonzero(candidate.mask))
+                second_area = int(np.count_nonzero(prior.mask))
+                union = first_area + second_area - intersection
+                iou = intersection / max(union, 1)
+                containment = intersection / max(min(first_area, second_area), 1)
+                if iou >= 0.80 or containment >= 0.92:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(candidate)
+        return kept
 
     @staticmethod
     def _convert_prompt_results(

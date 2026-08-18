@@ -1,15 +1,16 @@
 # Ouster route recordings to positioned meshes
 
 `scripts/ouster_prompt_to_scene.py` turns a recorded, single-sensor Ouster PCAP
-or OSF into one prompted SAM 3D mesh per associated static object. KISS SLAM
+or OSF into one prompted SAM 3D mesh per evidence-qualified object. KISS SLAM
 runs on every scan, while SAM 3 runs only on motion-selected keyframes and SAM
-3D runs only once for each accepted track.
+3D runs on up to three ranked views for each accepted track.
 
 The first version expects `ChanField.RGB` to be pixel-registered with `RANGE`.
-It targets bounded, static objects such as vehicles, signs, poles, equipment,
-and trees. Tracks are classified as confirmed static, dynamic, or unconfirmed;
-only confirmed-static tracks are meshed. Two observations can establish
-motion, while a singleton remains unconfirmed instead of being assumed static.
+It targets bounded objects such as vehicles, signs, poles, equipment, and
+trees. Motion remains recorded as diagnostic evidence, but it is not a mesh
+eligibility gate because viewpoint-dependent LiDAR surface centroids can move
+by several metres on a parked elongated object. Ambiguous objects are placed
+from a single timestamp instead of fusing incompatible geometry.
 
 ## Environment setup
 
@@ -35,8 +36,8 @@ The route orchestrator discovers `sam3-mask-route` in the sibling
 micromamba run -n sam3d-objects \
   python scripts/ouster_prompt_to_scene.py run /data/route.osf \
   --output-dir outputs/route \
-  --prompt "parked car" \
-  --prompt "traffic sign" \
+  --prompts "parked car,traffic sign" \
+  --synonyms "vehicle:parked car" \
   --point-cloud route.ply
 ```
 
@@ -51,7 +52,8 @@ python scripts/ouster_prompt_to_scene.py run /data/route.osf \
   --output-dir outputs/window \
   --start-frame 1001 \
   --stop-frame 1500 \
-  --prompt "vehicle"
+  --prompts "car,truck" \
+  --synonyms "vehicle:car,truck"
 ```
 
 Frame bounds are 1-based and inclusive, matching `scan_index` and keyframe
@@ -61,15 +63,24 @@ its own local world origin. If `--max-scans` is also present, it limits scans
 inside the window. Frame bounds are not accepted for PCAP inputs.
 
 The default keyframe trigger is 5 metres or 5 degrees since the previous
-keyframe. The route-oriented SAM 3D defaults are 10,000 faces, 15 sampling
+keyframe. Extraction also retains supplemental frames at 1 metre spacing.
+SAM 3 initially runs on the baseline keyframes, then uses up to two recovery
+rounds (one neighboring supplemental frame on either side per weak track) for
+singletons, tracks without reconstruction evidence, range-skipped tracks, or
+tracks without a strong nontruncated view. Disable this with
+`--no-adaptive-sam3-recovery`, change the dense spacing with
+`--sam3-recovery-distance-m`, or change the round limit with
+`--sam3-recovery-rounds`. The route-oriented SAM 3D defaults are 10,000 faces, 15 sampling
 steps in each diffusion stage, flat shading, and the low-VRAM memory profile.
 Face decimation reduces output complexity; the reduced sampling steps provide
 the inference-time saving.
 
-Mesh reconstruction is limited by default to tracks with at least one cleaned
-observation at or below 30 metres median LiDAR range. Far observations still
-contribute to association and motion classification, but they cannot supply
-SAM 3D imagery or metric fitting points. Change the limit with
+Mesh reconstruction accepts one strong observation with at least 20% coherent
+depth support, or two weaker observations from distinct frames that repeat in
+a deterministic spatial consensus. It is limited by default to qualifying
+observations at or below 30 metres median LiDAR range. Far observations still
+contribute to association and diagnostics, but they cannot supply SAM 3D
+imagery or metric fitting points. Change the limit with
 `--max-mesh-range-m`; use `--no-max-mesh-range` to disable it.
 
 Coincident same-prompt LiDAR tracks are suppressed before reconstruction by
@@ -86,7 +97,9 @@ this with `--duplicate-track-max-centroid-m`,
 Position fitting is grounded by default. SAM 3D's PyTorch3D row-vector pose is
 converted to the GLB/world column-vector convention, GLB local Y is checked
 against SLAM world-up, and elongated meshes are aligned to the robust
-horizontal principal axis of their aggregated LiDAR points. The default
+horizontal principal axis of their evidence-qualified LiDAR points. The mesh
+is also aligned with the selected observation in the camera tangent plane
+without changing SAM 3D's estimated depth. The default
 `--fit-mode raycast` reconstructs the original per-pixel LiDAR rays from every
 reliable, range-qualified observation and compares their measured ranges with
 the first mesh intersections. It can adjust yaw, translation, and bounded
@@ -98,7 +111,10 @@ still constrain range and translation but cannot dominate heading. Informative
 views estimate heading from robust local surface tangents, combining
 perpendicular footprint faces modulo 90 degrees instead of using a
 viewpoint-biased global PCA axis. They also receive stricter depth and
-mask-border regression checks. Use
+mask-border regression checks. Every final placement must also pass absolute
+depth-residual, mask-hit, background-clearance, finite-dimension, and neighbor
+centroid checks. A failed placement causes the next ranked SAM 3D view to be
+tried. Multi-view disagreement falls back to a selected-frame snapshot. Use
 `--fit-mode none` to retain only the upright,
 pointmap-derived pose. Ray count, view count, scale-change, and optimization
 limits are controlled by `--fit-max-rays-per-view`, `--fit-max-views`,
@@ -111,8 +127,7 @@ python scripts/ouster_prompt_to_scene.py extract /data/route.osf \
   --output-dir outputs/route
 
 python scripts/ouster_prompt_to_scene.py segment outputs/route \
-  --prompt "parked car" \
-  --prompt "traffic sign"
+  --prompts "parked car,traffic sign"
 
 python scripts/ouster_prompt_to_scene.py reconstruct outputs/route
 ```
@@ -124,14 +139,14 @@ aggregate scene after changing overlap thresholds with:
 sam3d-ouster-route scene build outputs/route --overwrite
 ```
 
-By default, same-prompt meshes conflict when their rasterized world-XY convex
-footprints have at least 0.35 IoU and 0.75 smaller-footprint containment, with
-at least 0.50 vertical overlap. Duplicate LiDAR support also creates a scene
-conflict even if a bad final pose displaced the meshes apart. The stronger
-LiDAR/ray-fit candidate remains in `scene.glb`; suppressed individual GLBs are
-kept for inspection and `scene.json` records the winner, loser, reason,
-metrics, and quality summaries. Use `--no-suppress-overlapping-meshes` to keep
-all successful meshes, or tune `--mesh-overlap-min-iou`,
+Same-prompt meshes are reported as conflicts when their rasterized world-XY convex
+footprints have at least 0.35 IoU or 0.75 smaller-footprint containment, with
+at least 0.50 vertical overlap. Mesh overlap alone never deletes a spatially
+distinct LiDAR track: all successful meshes remain in `scene.glb`, and
+`scene.json.mesh_conflicts` records overlap, centroid distance, duplicate
+evidence, and quality summaries. Duplicate tracks are removed earlier only
+when shared-frame LiDAR evidence proves they represent the same object. Tune
+conflict reporting with `--mesh-overlap-min-iou`,
 `--mesh-overlap-min-containment`, `--mesh-vertical-overlap-min`, and
 `--mesh-overlap-resolution-m`.
 
@@ -145,8 +160,9 @@ python scripts/ouster_prompt_to_scene.py track outputs/route \
 python scripts/ouster_prompt_to_scene.py reconstruct outputs/route --overwrite
 ```
 
-The default motion threshold is 0.5 m/s. Use
-`--dynamic-min-speed-mps` on either `segment` or `track` to change it. The
+The default diagnostic motion threshold is 0.5 m/s. Use
+`--dynamic-min-speed-mps` on either `segment` or `track` to change it; the
+result never controls reconstruction eligibility. The
 model-free tracking pass retains multiple coherent range layers long enough to
 prefer the one agreeing with a confirmed-static multi-frame track; this avoids
 scaling a distant object from foreground LiDAR leakage.
@@ -168,7 +184,7 @@ The run directory contains:
 - `tracks.json`, all-observation point samples, range-qualified reconstruction
   points, selected RGB/mask pairs, and fit diagnostics, including the raw SAM
   3D pose and orientation-prior decisions;
-- one `meshes/<track-id>.glb` per successful static track;
+- one `meshes/<track-id>.glb` per successful evidence-qualified track;
 - `scene.glb` and an authoritative `scene.json` transform listing;
 - optional unclassified binary RGB `route.ply` visual context.
 
@@ -186,13 +202,10 @@ the requested and effective bounds, recording length, processed count,
 numbering convention, and fresh-SLAM origin behavior. Trajectory and keyframe
 scan indices remain absolute positions in the source recording.
 
-If a track has insufficient coherent range pixels, is dynamic, unconfirmed, or
-outside the mesh range, or fails SAM 3D reconstruction, its reason remains in
-`tracks.json`; other tracks continue processing.
-
-Scene-level suppression does not change track status or delete the losing
-`meshes/<track-id>.glb`. Inspect `scene.json.suppressed_meshes` to distinguish
-duplicate-support suppression from final world-mesh overlap suppression.
+If a track lacks strong or repeatable weak evidence, is outside the mesh range,
+or fails SAM 3D or placement validation, its explicit reason remains in
+`tracks.json`; other tracks continue processing. Inspect
+`scene.json.mesh_conflicts` for overlaps that were retained for review.
 
 ## Prompted route surfaces as a TIN
 
@@ -206,8 +219,7 @@ Run the complete workflow with one or more literal surface descriptions:
 ```bash
 sam3d-ouster-route surface run /data/route.osf \
   --output-dir outputs/road-surface \
-  --prompt "dirt road" \
-  --prompt "gravel carriageway"
+  --prompts "dirt road,gravel carriageway"
 ```
 
 Surface runs select a keyframe every 1 metre by default. The usual extraction
@@ -224,8 +236,7 @@ sam3d-ouster-route extract /data/route.osf \
   --keyframe-distance-m 1
 
 sam3d-ouster-route surface segment outputs/road-surface \
-  --prompt "unpaved track" \
-  --prompt "gravel road"
+  --prompts "unpaved track,gravel road"
 
 sam3d-ouster-route surface build outputs/road-surface \
   --surface-resolution-m 0.20 \

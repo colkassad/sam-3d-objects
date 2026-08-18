@@ -6,6 +6,7 @@ import torch
 from PIL import Image
 
 from sam3_masking.generator import Sam3MaskGenerator, _as_numpy
+from sam3_masking.types import MaskPrediction
 
 
 class FakeModel:
@@ -160,4 +161,26 @@ def test_results_are_sorted_globally_across_prompts():
         "traffic cone",
         "parked car",
         "parked car",
+    ]
+
+
+def test_synonym_results_are_canonicalized_and_overlapping_aliases_deduplicated():
+    first = np.zeros((4, 5), dtype=bool)
+    first[1:3, 1:4] = True
+    overlapping = first.copy()
+    distinct = np.zeros((4, 5), dtype=bool)
+    distinct[0, 0] = True
+    predictions = [
+        MaskPrediction("p000-i000", "car", 0.8, (1, 1, 4, 3), first),
+        MaskPrediction("p001-i000", "truck", 0.9, (1, 1, 4, 3), overlapping),
+        MaskPrediction("p001-i001", "truck", 0.7, (0, 0, 1, 1), distinct),
+    ]
+
+    kept = Sam3MaskGenerator._canonicalize_predictions(
+        predictions, {"car": "vehicle", "truck": "vehicle"}
+    )
+
+    assert [(value.prompt, value.query_prompt, value.score) for value in kept] == [
+        ("vehicle", "truck", 0.9),
+        ("vehicle", "truck", 0.7),
     ]

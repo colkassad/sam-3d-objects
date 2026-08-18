@@ -37,6 +37,7 @@ from .ouster_adapter import OusterAdapter
 class ExtractConfig:
     keyframe_distance_m: float = 5.0
     keyframe_angle_deg: float = 5.0
+    sam3_recovery_distance_m: float = 1.0
     slam_min_range_m: float = 1.0
     slam_max_range_m: float = 75.0
     slam_voxel_size_m: float = 1.0
@@ -51,6 +52,8 @@ class ExtractConfig:
             raise ValueError("keyframe_distance_m must be greater than zero")
         if self.keyframe_angle_deg <= 0:
             raise ValueError("keyframe_angle_deg must be greater than zero")
+        if self.sam3_recovery_distance_m <= 0:
+            raise ValueError("sam3_recovery_distance_m must be greater than zero")
         if self.slam_min_range_m < 0 or self.slam_max_range_m <= self.slam_min_range_m:
             raise ValueError("SLAM range limits are invalid")
         if self.slam_voxel_size_m <= 0 or self.point_cloud_voxel_m <= 0:
@@ -321,7 +324,10 @@ def _initial_manifest(source: Path, metadata: Optional[Path]) -> dict[str, Any]:
         "calibration": None,
         "trajectory": None,
         "keyframes": [],
+        "recovery_frames": [],
         "prompts": [],
+        "synonyms": {},
+        "prompt_categories": [],
         "surface_prompts": [],
         "tracks": None,
         "source_window": None,
@@ -417,9 +423,14 @@ def extract_route(
     if overwrite or stage:
         _clean_extract_outputs(run_dir, manifest)
         manifest["keyframes"] = []
+        manifest["recovery_frames"] = []
         manifest["trajectory"] = None
         manifest["calibration"] = None
         manifest["tracks"] = None
+        manifest["prompts"] = []
+        manifest["synonyms"] = {}
+        manifest["prompt_categories"] = []
+        manifest.pop("sam3_recovery", None)
         manifest["source_window"] = None
         manifest.get("stages", {}).pop("segment", None)
         manifest.get("stages", {}).pop("reconstruct", None)
@@ -462,8 +473,12 @@ def extract_route(
         selector = KeyframeSelector(
             config.keyframe_distance_m, config.keyframe_angle_deg
         )
+        recovery_selector = KeyframeSelector(
+            config.sam3_recovery_distance_m, config.keyframe_angle_deg
+        )
         trajectory: list[TrajectorySample] = []
         keyframes: list[dict[str, Any]] = []
+        recovery_frames: list[dict[str, Any]] = []
         last_snapshot: Optional[ScanSnapshot] = None
         last_selected_index: Optional[int] = None
         calibration_written = False
@@ -557,9 +572,13 @@ def extract_route(
                 manifest["calibration"] = relative_artifact(run_dir, calibration_json)
                 calibration_written = True
 
-            if selector.select(pose):
+            baseline_selected = selector.select(pose)
+            recovery_selected = recovery_selector.select(pose)
+            if baseline_selected:
                 keyframes.append(_save_keyframe(run_dir, snapshot))
                 last_selected_index = snapshot.scan_index
+            elif recovery_selected:
+                recovery_frames.append(_save_keyframe(run_dir, snapshot))
 
             if cloud is not None:
                 range_staggered = adapter.range_staggered(scan)
@@ -574,6 +593,11 @@ def extract_route(
         if not trajectory or last_snapshot is None:
             raise RuntimeError("SLAM produced no valid scans")
         if last_selected_index != last_snapshot.scan_index:
+            recovery_frames = [
+                frame
+                for frame in recovery_frames
+                if frame["scan_index"] != last_snapshot.scan_index
+            ]
             keyframes.append(_save_keyframe(run_dir, last_snapshot))
         trajectory_csv, trajectory_npz = _write_trajectory(run_dir, trajectory)
         manifest["trajectory"] = {
@@ -594,6 +618,7 @@ def extract_route(
             "slam_origin": "reset_at_effective_start_frame",
         }
         manifest["keyframes"] = keyframes
+        manifest["recovery_frames"] = recovery_frames
         manifest["software"]["ouster_sdk"] = adapter.sdk_version
         if cloud is not None:
             points, colors = cloud.arrays()

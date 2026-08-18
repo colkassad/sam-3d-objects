@@ -13,6 +13,7 @@ from .artifacts import (
     update_mesh_records,
 )
 from .checkpoint import find_repo_root
+from .prompts import parse_prompt_catalog
 
 
 def _load_sam3d_api(repo_root: Path) -> tuple[Callable[..., Any], Callable[..., Any]]:
@@ -113,10 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Segment prompted objects with SAM 3, then reconstruct each " "with SAM 3D."
-        )
+        ),
+        allow_abbrev=False,
     )
     parser.add_argument("--image", type=Path, required=True)
-    parser.add_argument("--prompt", action="append", required=True)
+    parser.add_argument("--prompts", required=True)
+    parser.add_argument("--synonyms", default="")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--source-id")
     parser.add_argument("--sam3-executable", default="sam3-mask")
@@ -150,6 +153,7 @@ def run(
     args: argparse.Namespace, *, subprocess_run: Callable[..., Any] = subprocess.run
 ) -> int:
     repo_root = find_repo_root(args.repo_root)
+    catalog = parse_prompt_catalog(args.prompts, args.synonyms)
     output_dir = args.output_dir.expanduser().resolve()
     image_path = args.image.expanduser().resolve()
     sam3_model_dir = args.sam3_model_dir.expanduser()
@@ -179,8 +183,9 @@ def run(
         command.extend(("--source-id", args.source_id))
     if args.profile_memory:
         command.append("--profile-memory")
-    for prompt in args.prompt:
-        command.extend(("--prompt", prompt))
+    command.extend(("--prompts", ",".join(catalog.prompts)))
+    if args.synonyms.strip():
+        command.extend(("--synonyms", args.synonyms))
 
     completed = subprocess_run(command, check=False)
     if completed.returncode != 0:

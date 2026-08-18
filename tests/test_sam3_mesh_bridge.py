@@ -123,7 +123,7 @@ def test_bridge_waits_for_segmenter_before_reconstruction(tmp_path, monkeypatch)
         [
             "--image",
             str(image_path),
-            "--prompt",
+            "--prompts",
             "car",
             "--output-dir",
             str(output_dir),

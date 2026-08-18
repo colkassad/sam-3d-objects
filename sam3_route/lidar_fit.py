@@ -61,7 +61,9 @@ def world_rays_from_frame(
     return origins, directions, ranges
 
 
-def _deterministic_pixels(mask: np.ndarray, maximum: int) -> tuple[np.ndarray, np.ndarray]:
+def _deterministic_pixels(
+    mask: np.ndarray, maximum: int
+) -> tuple[np.ndarray, np.ndarray]:
     rows, columns = np.nonzero(mask)
     if len(rows) <= maximum:
         return rows, columns
@@ -85,7 +87,7 @@ def make_fit_view(
     valid = np.isfinite(ranges_m) & np.all(np.isfinite(origins_world), axis=-1)
     valid &= np.all(np.isfinite(directions_world), axis=-1)
     inside = np.asarray(cleaned_mask, dtype=bool) & valid
-    if int(np.count_nonzero(inside)) < 50:
+    if int(np.count_nonzero(inside)) < 10:
         return None
     rows, columns = _deterministic_pixels(inside, maximum_rays)
 
@@ -113,7 +115,9 @@ def make_fit_view(
         directions_world=directions_world[rows, columns].astype(np.float64),
         ranges_m=ranges_m[rows, columns].astype(np.float64),
         background_origins_world=origins_world[bg_rows, bg_columns].astype(np.float64),
-        background_directions_world=directions_world[bg_rows, bg_columns].astype(np.float64),
+        background_directions_world=directions_world[bg_rows, bg_columns].astype(
+            np.float64
+        ),
         background_ranges_m=ranges_m[bg_rows, bg_columns].astype(np.float64),
         ground_points_world=ground_points.astype(np.float64),
         sensor_position_world=sensor_position.astype(np.float64),
@@ -121,14 +125,19 @@ def make_fit_view(
     )
 
 
-def select_diverse_views(views: Iterable[LidarFitView], maximum: int) -> list[LidarFitView]:
+def select_diverse_views(
+    views: Iterable[LidarFitView], maximum: int
+) -> list[LidarFitView]:
     candidates = sorted(views, key=lambda value: (-value.weight, value.observation_id))
     if len(candidates) <= maximum:
         return candidates
     selected = [candidates.pop(0)]
     center = np.median(
         np.concatenate(
-            [v.origins_world + v.directions_world * v.ranges_m[:, None] for v in selected],
+            [
+                v.origins_world + v.directions_world * v.ranges_m[:, None]
+                for v in selected
+            ],
             axis=0,
         ),
         axis=0,
@@ -160,10 +169,14 @@ def select_diverse_views(views: Iterable[LidarFitView], maximum: int) -> list[Li
 
 def _huber(values: np.ndarray, delta: float = 0.15) -> np.ndarray:
     absolute = np.abs(values)
-    return np.where(absolute <= delta, 0.5 * absolute**2 / delta, absolute - 0.5 * delta)
+    return np.where(
+        absolute <= delta, 0.5 * absolute**2 / delta, absolute - 0.5 * delta
+    )
 
 
-def _raycast(vertices_world: np.ndarray, faces: np.ndarray, rays: np.ndarray) -> np.ndarray:
+def _raycast(
+    vertices_world: np.ndarray, faces: np.ndarray, rays: np.ndarray
+) -> np.ndarray:
     import open3d as o3d
 
     scene = o3d.t.geometry.RaycastingScene()
@@ -219,7 +232,10 @@ def _horizontal_support(points: np.ndarray, sensors: np.ndarray) -> dict[str, An
     axis = np.asarray([vh[0, 0], vh[0, 1], 0.0])
     axis /= max(np.linalg.norm(axis), 1e-8)
     projections = points @ axis
-    low, high = float(np.quantile(projections, 0.02)), float(np.quantile(projections, 0.98))
+    low, high = (
+        float(np.quantile(projections, 0.02)),
+        float(np.quantile(projections, 0.98)),
+    )
     # Point counts are viewpoint biased. Occupancy makes every supported interval equal.
     bins = np.arange(low, high + 0.1001, 0.10)
     occupied = np.histogram(projections, bins=bins)[0] > 0
@@ -227,7 +243,10 @@ def _horizontal_support(points: np.ndarray, sensors: np.ndarray) -> dict[str, An
         occupied = binary_dilation(occupied, iterations=1)
     indices = np.flatnonzero(occupied)
     if len(indices):
-        low, high = float(bins[indices[0]]), float(bins[min(indices[-1] + 1, len(bins) - 1)])
+        low, high = (
+            float(bins[indices[0]]),
+            float(bins[min(indices[-1] + 1, len(bins) - 1)]),
+        )
     sensor_projection = float(np.median(sensors @ axis))
     near_is_low = abs(sensor_projection - low) <= abs(sensor_projection - high)
     return {
@@ -262,7 +281,9 @@ def _fit_ground_plane(points: np.ndarray) -> dict[str, Any]:
         "offset": float(-normal @ center),
         "tilt_deg": tilt,
         "inlier_count": int(np.count_nonzero(inliers)),
-        "residual_median_m": float(np.median(residuals[inliers])) if np.any(inliers) else None,
+        "residual_median_m": float(np.median(residuals[inliers]))
+        if np.any(inliers)
+        else None,
         "reason": None if accepted else "plane is sparse or inconsistent with world-up",
     }
 
@@ -324,7 +345,7 @@ def _heading_information(
         # footprint without letting a densely sampled face choose the sign.
         moment = sum(
             weight * np.exp(4j * angle)
-            for angle, weight in zip(local_angles, local_weights)
+            for angle, weight in zip(local_angles, local_weights, strict=False)
         )
         tangent_strength = float(abs(moment) / max(sum(local_weights), 1e-9))
         tangent_angle = float(np.angle(moment) / 4.0)
@@ -364,7 +385,9 @@ def _view_metrics(
     residuals = hits[finite] - view.ranges_m[finite]
     depth_loss = float(np.mean(_huber(residuals))) if len(residuals) else 1.0
     missing_fraction = float(1.0 - np.mean(finite))
-    median_residual = float(np.median(np.abs(residuals))) if len(residuals) else math.inf
+    median_residual = (
+        float(np.median(np.abs(residuals))) if len(residuals) else math.inf
+    )
     background_penalty = 0.0
     false_background_fraction = 0.0
     if len(view.background_ranges_m):
@@ -397,6 +420,59 @@ def _view_metrics(
     }
 
 
+def evaluate_mesh_views(
+    vertices_local: np.ndarray,
+    faces: np.ndarray,
+    transform: np.ndarray,
+    views: list[LidarFitView],
+) -> dict[str, Any]:
+    """Evaluate an already-positioned mesh against the supplied sensor views."""
+
+    vertices = np.asarray(vertices_local, dtype=np.float64)
+    matrix = np.asarray(transform, dtype=np.float64)
+    world = vertices @ matrix[:3, :3].T + matrix[:3, 3]
+    metrics = []
+    for view in views:
+        metric = _view_metrics(world, faces, view)
+        metric["observation_id"] = view.observation_id
+        metrics.append(metric)
+    ray_count = sum(value["ray_count"] for value in metrics)
+    background_count = sum(value["background_ray_count"] for value in metrics)
+    return {
+        "views": metrics,
+        "view_count": len(metrics),
+        "median_depth_residual_m": (
+            float(np.median([value["median_depth_residual_m"] for value in metrics]))
+            if metrics
+            else math.inf
+        ),
+        "hit_fraction": (
+            float(
+                sum(value["hit_fraction"] * value["ray_count"] for value in metrics)
+                / ray_count
+            )
+            if ray_count
+            else 0.0
+        ),
+        "false_background_fraction": (
+            float(
+                sum(
+                    value["false_background_fraction"] * value["background_ray_count"]
+                    for value in metrics
+                )
+                / background_count
+            )
+            if background_count
+            else 0.0
+        ),
+        "median_range_m": (
+            float(np.median(np.concatenate([view.ranges_m for view in views])))
+            if views
+            else math.inf
+        ),
+    }
+
+
 def refine_mesh_with_lidar_rays(
     vertices_local: np.ndarray,
     faces: np.ndarray,
@@ -423,18 +499,41 @@ def refine_mesh_with_lidar_rays(
     sensors = np.stack([view.sensor_position_world for view in views])
     support = _horizontal_support(points, sensors)
     heading_axis, heading_views, heading_records = _heading_information(views, support)
-    ground_points = np.concatenate(
-        [view.ground_points_world for view in views if len(view.ground_points_world)],
-        axis=0,
-    ) if any(len(view.ground_points_world) for view in views) else np.empty((0, 3))
-    ground = _fit_ground_plane(ground_points) if grounded else {"accepted": False, "reason": "disabled"}
+    ground_points = (
+        np.concatenate(
+            [
+                view.ground_points_world
+                for view in views
+                if len(view.ground_points_world)
+            ],
+            axis=0,
+        )
+        if any(len(view.ground_points_world) for view in views)
+        else np.empty((0, 3))
+    )
+    ground = (
+        _fit_ground_plane(ground_points)
+        if grounded
+        else {"accepted": False, "reason": "disabled"}
+    )
 
     baseline = np.asarray(initial_transform, dtype=np.float64)
     max_translation = min(
         2.0,
-        max(0.5, 0.25 * float(np.linalg.norm(np.quantile(points, 0.9, axis=0) - np.quantile(points, 0.1, axis=0)))),
+        max(
+            0.5,
+            0.25
+            * float(
+                np.linalg.norm(
+                    np.quantile(points, 0.9, axis=0) - np.quantile(points, 0.1, axis=0)
+                )
+            ),
+        ),
     )
-    scale_bound = math.log(1.0 - max_axis_scale_change), math.log(1.0 + max_axis_scale_change)
+    scale_bound = (
+        math.log(1.0 - max_axis_scale_change),
+        math.log(1.0 + max_axis_scale_change),
+    )
     bounds = [
         (-max_translation, max_translation),
         (-max_translation, max_translation),
@@ -477,9 +576,7 @@ def refine_mesh_with_lidar_rays(
             mesh_high = float(np.quantile(mesh_projection, 0.98))
             mesh_near = mesh_low if support["near_is_low"] else mesh_high
             mesh_far = mesh_high if support["near_is_low"] else mesh_low
-            loss += 0.50 * float(
-                _huber(np.asarray([mesh_near - support["near_m"]]))[0]
-            )
+            loss += 0.50 * float(_huber(np.asarray([mesh_near - support["near_m"]]))[0])
             loss += 0.15 * float(
                 _huber(np.asarray([mesh_far - support["far_m"]]), 0.30)[0]
             )
@@ -516,9 +613,7 @@ def refine_mesh_with_lidar_rays(
         base_axis[0] * target_axis[1] - base_axis[1] * target_axis[0],
         base_axis[:2] @ target_axis[:2],
     )
-    bounded_heading_delta = float(
-        np.clip(heading_delta, bounds[3][0], bounds[3][1])
-    )
+    bounded_heading_delta = float(np.clip(heading_delta, bounds[3][0], bounds[3][1]))
     heading_seed = zero.copy()
     heading_seed[3] = bounded_heading_delta
     projected = base_world @ support["axis_world"]
@@ -559,7 +654,9 @@ def refine_mesh_with_lidar_rays(
         "performed": False,
         "target_delta_deg": math.degrees(heading_delta),
         "bounded_target_delta_deg": math.degrees(bounded_heading_delta),
-        "informative_observation_ids": [value.observation_id for value in heading_views],
+        "informative_observation_ids": [
+            value.observation_id for value in heading_views
+        ],
     }
     if heading_views:
         yaw_before_polish = float(best_parameters[3])
@@ -569,12 +666,8 @@ def refine_mesh_with_lidar_rays(
             heading_target=bounded_heading_delta,
             global_constraints=False,
         )
-        minimum_yaw = max(
-            bounds[3][0], bounded_heading_delta - math.radians(5.0)
-        )
-        maximum_yaw = min(
-            bounds[3][1], bounded_heading_delta + math.radians(5.0)
-        )
+        minimum_yaw = max(bounds[3][0], bounded_heading_delta - math.radians(5.0))
+        maximum_yaw = min(bounds[3][1], bounded_heading_delta + math.radians(5.0))
         yaw_values = np.linspace(minimum_yaw, maximum_yaw, polish_grid_count)
         yaw_values = np.unique(
             np.clip(
@@ -650,7 +743,9 @@ def refine_mesh_with_lidar_rays(
     candidate_score, candidate_metrics = evaluate(best_parameters, include_metrics=True)
     informative_ids = {value.observation_id for value in heading_views}
     per_view_acceptance: list[dict[str, Any]] = []
-    for baseline_metric, candidate_metric in zip(baseline_metrics, candidate_metrics):
+    for baseline_metric, candidate_metric in zip(
+        baseline_metrics, candidate_metrics, strict=False
+    ):
         informative = baseline_metric["observation_id"] in informative_ids
         depth_tolerance = 0.03 if informative else 0.15
         background_tolerance = 0.03 if informative else 0.10
@@ -680,7 +775,7 @@ def refine_mesh_with_lidar_rays(
     bounds_satisfied = bool(
         all(
             lower - 1e-9 <= float(value) <= upper + 1e-9
-            for value, (lower, upper) in zip(best_parameters, bounds)
+            for value, (lower, upper) in zip(best_parameters, bounds, strict=False)
         )
     )
     accepted = bool(
@@ -692,7 +787,9 @@ def refine_mesh_with_lidar_rays(
     report = {
         "method": "multi_view_lidar_raycast",
         "accepted": accepted,
-        "reason": None if accepted else "candidate did not improve the bounded sensor-ray objective",
+        "reason": None
+        if accepted
+        else "candidate did not improve the bounded sensor-ray objective",
         "baseline_score": baseline_score,
         "candidate_score": candidate_score,
         "relative_improvement": improvement,

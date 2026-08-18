@@ -100,10 +100,8 @@ def test_demo_forwards_prompts_defaults_and_mesh_options(tmp_path, monkeypatch, 
         [
             "--image",
             str(image),
-            "--prompt",
-            " parked car ",
-            "--prompt",
-            "traffic cone",
+            "--prompts",
+            " parked car , traffic cone ",
             "--sam3-model-dir",
             str(model),
             "--sam3d-config",
@@ -121,7 +119,7 @@ def test_demo_forwards_prompts_defaults_and_mesh_options(tmp_path, monkeypatch, 
 
     assert demo.run(args) == 0
     forwarded = captured["args"]
-    assert forwarded.prompt == ["parked car", "traffic cone"]
+    assert forwarded.prompts == "parked car,traffic cone"
     assert forwarded.sam3_executable == str(executable.resolve())
     assert forwarded.output_dir == tmp_path / "outputs/sam3-demo/road-scene"
     assert forwarded.score_threshold == forwarded.mask_threshold == 0.5
@@ -174,7 +172,7 @@ def test_demo_preserves_failure_status_and_summarizes_new_manifest(
         [
             "--image",
             str(image),
-            "--prompt",
+            "--prompts",
             "car",
             "--output-dir",
             str(output_dir),
@@ -215,7 +213,7 @@ def test_demo_zero_detections_succeeds(tmp_path, monkeypatch, capsys):
         [
             "--image",
             str(image),
-            "--prompt",
+            "--prompts",
             "car",
             "--output-dir",
             str(output_dir),
@@ -232,7 +230,8 @@ def test_demo_zero_detections_succeeds(tmp_path, monkeypatch, capsys):
 def test_help_smoke():
     help_text = demo.build_parser().format_help()
     assert "--image" in help_text
-    assert "--prompt" in help_text
+    assert "--prompts" in help_text
+    assert "--prompt " not in help_text
     assert "--mesh-target-faces" in help_text
 
 

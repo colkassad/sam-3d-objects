@@ -6,19 +6,25 @@ from typing import Optional, Sequence
 
 from .artifacts import write_mask_manifest
 from .generator import Sam3MaskGenerator
+from .prompts import parse_prompt_catalog
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate SAM 3 instance masks for one image and text prompts."
+        description="Generate SAM 3 instance masks for one image and text prompts.",
+        allow_abbrev=False,
     )
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument(
-        "--prompt",
-        action="append",
+        "--prompts",
         required=True,
-        help="Text concept prompt; repeat for multiple prompts.",
+        help="Comma-separated text concept prompts.",
+    )
+    parser.add_argument(
+        "--synonyms",
+        default="",
+        help="Canonical groups: 'vehicle:car,truck;sign:road sign,traffic sign'.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--source-id")
@@ -34,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    catalog = parse_prompt_catalog(args.prompts, args.synonyms)
     torch = None
     if args.profile_memory:
         import torch as torch_module
@@ -47,10 +54,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ) as generator:
         frame = generator.segment(
             args.image,
-            args.prompt,
+            catalog.prompts,
             score_threshold=args.score_threshold,
             mask_threshold=args.mask_threshold,
             source_id=args.source_id,
+            synonym_to_canonical=catalog.synonym_to_canonical,
         )
         manifest_path = write_mask_manifest(
             frame, args.output_dir, image_path=args.image

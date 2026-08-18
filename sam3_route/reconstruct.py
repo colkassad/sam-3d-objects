@@ -31,12 +31,18 @@ from .geometry import (
 )
 from .lidar_fit import (
     LidarFitView,
+    evaluate_mesh_views,
     make_fit_view,
     refine_mesh_with_lidar_rays,
     select_diverse_views,
     world_rays_from_frame,
 )
-from .scene import SceneConfig, compose_scene
+from .scene import (
+    SceneConfig,
+    _convex_footprint,
+    _inside_convex_polygon,
+    compose_scene,
+)
 from .tracking import MIN_RECONSTRUCTION_INLIER_FRACTION
 
 
@@ -59,6 +65,7 @@ class ReconstructConfig:
     fit_grounded: bool = True
     fit_align_long_axis: bool = True
     fit_max_up_tilt_deg: float = 20.0
+    max_reconstruction_view_attempts: int = 3
 
     def __post_init__(self) -> None:
         if self.mesh_target_faces <= 0:
@@ -81,6 +88,10 @@ class ReconstructConfig:
             raise ValueError("fit_max_rotation_deg must be in (0, 180]")
         if not 0 < self.fit_max_up_tilt_deg < 90:
             raise ValueError("fit_max_up_tilt_deg must be in (0, 90)")
+        if self.max_reconstruction_view_attempts <= 0:
+            raise ValueError(
+                "max_reconstruction_view_attempts must be greater than zero"
+            )
 
     def manifest_value(self) -> dict[str, Any]:
         return asdict(self)
@@ -94,6 +105,7 @@ def _load_inference_api() -> tuple[Callable[..., Any], Callable[..., Any]]:
     if str(notebook_dir) not in sys.path:
         sys.path.insert(0, str(notebook_dir))
     from inference import Inference, load_image
+
     return Inference, load_image
 
 
@@ -129,7 +141,9 @@ def _square_crop(
         raise ValueError("selected mask is empty")
     center_row = (int(rows.min()) + int(rows.max())) / 2.0
     center_col = (int(columns.min()) + int(columns.max())) / 2.0
-    size = max(int(rows.max() - rows.min() + 1), int(columns.max() - columns.min() + 1), 2)
+    size = max(
+        int(rows.max() - rows.min() + 1), int(columns.max() - columns.min() + 1), 2
+    )
     size = max(2, int(math.ceil(size * box_factor)))
     top = int(math.floor(center_row - size / 2))
     left = int(math.floor(center_col - size / 2))
@@ -158,13 +172,15 @@ def prepare_sam3d_inputs(
     """Build an object-centered RGB/mask and metric PyTorch3D pointmap."""
 
     observation = _prediction_for_track(track)
-    frame = next(
-        value for value in manifest["keyframes"] if value["id"] == observation["frame_id"]
-    )
+    frames = list(manifest["keyframes"]) + list(manifest.get("recovery_frames", []))
+    frame = next(value for value in frames if value["id"] == observation["frame_id"])
     rgb = np.asarray(Image.open(artifact_path(run_dir, frame["rgb"])).convert("RGB"))
-    mask = np.asarray(
-        Image.open(artifact_path(run_dir, observation["mask_path"])).convert("L")
-    ) > 0
+    mask = (
+        np.asarray(
+            Image.open(artifact_path(run_dir, observation["mask_path"])).convert("L")
+        )
+        > 0
+    )
     calibration_document = json.loads(
         artifact_path(run_dir, manifest["calibration"]).read_text(encoding="utf-8")
     )
@@ -180,7 +196,9 @@ def prepare_sam3d_inputs(
     points_world = transform_pointmap_per_column(points_sensor, poses, sensor_to_body)
     world_from_reference_sensor = poses[reference_column] @ sensor_to_body
     reference_sensor_from_world = np.linalg.inv(world_from_reference_sensor)
-    points_reference_sensor = transform_points(points_world, reference_sensor_from_world)
+    points_reference_sensor = transform_points(
+        points_world, reference_sensor_from_world
+    )
     selected_reference_points = points_reference_sensor[
         mask & np.all(np.isfinite(points_reference_sensor), axis=-1)
     ]
@@ -219,15 +237,16 @@ def prepare_sam3d_inputs(
         @ camera.sensor_from_camera
         @ np.linalg.inv(p3d_from_r3)
     )
+    forward_world = world_from_reference_sensor[:3, :3] @ forward
+    forward_world /= max(float(np.linalg.norm(forward_world)), 1e-8)
     context = {
         "frame_id": frame["id"],
         "roll_columns": shift,
         "world_from_pytorch3d_camera": world_from_p3d,
         "world_from_reference_sensor": world_from_reference_sensor,
+        "view_direction_world": forward_world,
     }
     return rgb, mask, pointmap_tensor, world_from_p3d, context
-
-
 
 
 def _unit_vector(value: np.ndarray, fallback: np.ndarray) -> np.ndarray:
@@ -300,9 +319,10 @@ def stabilize_mesh_orientation(
     current_projected = current_primary - desired_up * float(
         np.dot(current_primary, desired_up)
     )
-    if np.linalg.norm(current_projected) > 1e-8 and np.dot(
-        desired_primary, current_projected
-    ) < 0:
+    if (
+        np.linalg.norm(current_projected) > 1e-8
+        and np.dot(desired_primary, current_projected) < 0
+    ):
         desired_primary *= -1.0
 
     if primary_axis == 2:
@@ -337,8 +357,6 @@ def stabilize_mesh_orientation(
     }
 
 
-
-
 def _tensor_values(value: Any, count: int) -> np.ndarray:
     if hasattr(value, "detach"):
         value = value.detach()
@@ -365,20 +383,28 @@ def _as_trimesh(value: Any) -> Any:
     raise TypeError(f"unsupported SAM3D GLB type {type(value).__name__}")
 
 
-def _export_positioned_glb(mesh: Any, transform: np.ndarray, path: Path, node_name: str) -> None:
+def _export_positioned_glb(
+    mesh: Any, transform: np.ndarray, path: Path, node_name: str
+) -> None:
     import trimesh
 
     scene = trimesh.Scene()
-    scene.add_geometry(mesh, node_name=node_name, geom_name=node_name, transform=transform)
+    scene.add_geometry(
+        mesh, node_name=node_name, geom_name=node_name, transform=transform
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     scene.export(path, file_type="glb")
 
 
 def _reconstruction_eligible(track: dict[str, Any]) -> bool:
-    """Only confirmed-static, in-range tracks reach SAM3D."""
+    """Use evidence and range gates; motion is diagnostic only for new tracks."""
 
     if track.get("status") == "duplicate_skipped" or track.get("duplicate_of"):
         return False
+    evidence_gate = track.get("evidence_gate")
+    if evidence_gate is not None:
+        return bool(evidence_gate.get("range_eligible"))
+    # Older artifacts retain the legacy motion gate until tracks are rebuilt.
     motion_state = track.get("motion_state")
     if motion_state is None:
         return not bool(track.get("dynamic"))
@@ -395,6 +421,7 @@ def load_lidar_fit_views(
     *,
     maximum_rays: int,
     maximum_views: int,
+    preferred_observation_id: Optional[str] = None,
 ) -> list[LidarFitView]:
     """Load reliable range-qualified observations in their original viewpoints."""
 
@@ -405,29 +432,40 @@ def load_lidar_fit_views(
         ray_direction = calibration["ray_direction"].astype(np.float64)
         ray_origin = calibration["ray_origin"].astype(np.float64)
         sensor_to_body = calibration["sensor_to_body"].astype(np.float64)
-    frames = {value["id"]: value for value in manifest["keyframes"]}
+    frames = {
+        value["id"]: value
+        for value in list(manifest["keyframes"])
+        + list(manifest.get("recovery_frames", []))
+    }
+    evidence_gate = track.get("evidence_gate") or {}
     range_gate = track.get("range_gate") or {}
-    eligible_ids = range_gate.get("eligible_observation_ids")
+    eligible_ids = evidence_gate.get("range_eligible_observation_ids")
+    if eligible_ids is None:
+        eligible_ids = range_gate.get("eligible_observation_ids")
     eligible = set(eligible_ids) if eligible_ids is not None else None
     views: list[LidarFitView] = []
     for observation in track["observations"]:
         if eligible is not None and observation["id"] not in eligible:
             continue
         if (
-            float(observation.get("inlier_fraction", 0.0))
+            not evidence_gate
+            and float(observation.get("inlier_fraction", 0.0))
             < MIN_RECONSTRUCTION_INLIER_FRACTION
         ):
             continue
         frame = frames.get(observation["frame_id"])
         if frame is None:
             continue
-        cleaned_path = observation.get("cleaned_mask_path") or observation.get("mask_path")
+        cleaned_path = observation.get("cleaned_mask_path") or observation.get(
+            "mask_path"
+        )
         raw_path = observation.get("mask_path") or cleaned_path
         if not cleaned_path or not raw_path:
             continue
-        cleaned = np.asarray(
-            Image.open(artifact_path(run_dir, cleaned_path)).convert("L")
-        ) > 0
+        cleaned = (
+            np.asarray(Image.open(artifact_path(run_dir, cleaned_path)).convert("L"))
+            > 0
+        )
         raw = np.asarray(Image.open(artifact_path(run_dir, raw_path)).convert("L")) > 0
         with np.load(artifact_path(run_dir, frame["geometry"])) as geometry:
             origins, directions, ranges = world_rays_from_frame(
@@ -437,7 +475,9 @@ def load_lidar_fit_views(
                 geometry["body_to_world"],
                 sensor_to_body,
             )
-        quality = max(0.05, float(observation.get("quality", observation.get("score", 0.5))))
+        quality = max(
+            0.05, float(observation.get("quality", observation.get("score", 0.5)))
+        )
         quality *= max(0.20, float(observation.get("inlier_fraction", 1.0)))
         view = make_fit_view(
             observation_id=observation["id"],
@@ -452,6 +492,19 @@ def load_lidar_fit_views(
         if view is not None:
             views.append(view)
     selected = select_diverse_views(views, maximum_views)
+    if preferred_observation_id is not None:
+        preferred = next(
+            (
+                value
+                for value in views
+                if value.observation_id == preferred_observation_id
+            ),
+            None,
+        )
+        if preferred is not None and all(
+            value.observation_id != preferred_observation_id for value in selected
+        ):
+            selected = ([preferred] + selected)[:maximum_views]
     if selected:
         largest = max(value.weight for value in selected)
         selected = [
@@ -464,6 +517,202 @@ def load_lidar_fit_views(
             for value in selected
         ]
     return selected
+
+
+def align_mesh_to_observation_tangent(
+    vertices_local: np.ndarray,
+    transform: np.ndarray,
+    observation_points_world: np.ndarray,
+    view_direction_world: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Align mesh/support centers without changing the SAM3D depth estimate."""
+
+    vertices = np.asarray(vertices_local, dtype=np.float64)
+    points = np.asarray(observation_points_world, dtype=np.float64)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    matrix = np.asarray(transform, dtype=np.float64).copy()
+    if not len(vertices) or not len(points):
+        return matrix, {
+            "applied": False,
+            "reason": "mesh or observation support is empty",
+        }
+    direction = np.asarray(view_direction_world, dtype=np.float64).reshape(3)
+    direction /= max(float(np.linalg.norm(direction)), 1e-8)
+    local_center = np.median(vertices, axis=0)
+    mesh_center = transform_points(local_center[None], matrix)[0]
+    support_center = np.median(points, axis=0)
+    delta = support_center - mesh_center
+    tangent_delta = delta - direction * float(delta @ direction)
+    matrix[:3, 3] += tangent_delta
+    return matrix, {
+        "applied": True,
+        "mesh_center_before_world": mesh_center.tolist(),
+        "support_center_world": support_center.tolist(),
+        "translation_world_m": tangent_delta.tolist(),
+        "preserved_depth_delta_m": float(delta @ direction),
+    }
+
+
+def _neighbor_centroid_collisions(
+    track: dict[str, Any],
+    tracks: list[dict[str, Any]],
+    vertices_world: np.ndarray,
+) -> list[dict[str, Any]]:
+    footprint = _convex_footprint(vertices_world)
+    low = np.min(vertices_world, axis=0)
+    high = np.max(vertices_world, axis=0)
+    collisions: list[dict[str, Any]] = []
+    for other in tracks:
+        if other.get("id") == track.get("id"):
+            continue
+        if (
+            str(other.get("prompt", "")).casefold()
+            != str(track.get("prompt", "")).casefold()
+        ):
+            continue
+        if (
+            other.get("status") == "duplicate_skipped"
+            or other.get("duplicate_of") == track.get("id")
+            or track.get("duplicate_of") == other.get("id")
+        ):
+            continue
+        other_evidence = other.get("evidence_gate")
+        if other.get("status") not in {"pending", "ok"} and not bool(
+            other_evidence and other_evidence.get("range_eligible")
+        ):
+            continue
+        centroid = np.asarray(other.get("centroid_world"), dtype=np.float64)
+        if centroid.shape != (3,) or not np.all(np.isfinite(centroid)):
+            continue
+        horizontal_inside = bool(
+            _inside_convex_polygon(centroid[None, :2], footprint)[0]
+        )
+        vertical_inside = bool(low[2] - 0.25 <= centroid[2] <= high[2] + 0.25)
+        if horizontal_inside and vertical_inside:
+            collisions.append(
+                {
+                    "track_id": other["id"],
+                    "centroid_world": centroid.tolist(),
+                    "centroid_distance_m": float(
+                        np.linalg.norm(
+                            centroid
+                            - np.asarray(track["centroid_world"], dtype=np.float64)
+                        )
+                    ),
+                }
+            )
+    return collisions
+
+
+def validate_mesh_placement(
+    vertices_local: np.ndarray,
+    faces: np.ndarray,
+    transform: np.ndarray,
+    views: list[LidarFitView],
+    track: dict[str, Any],
+    tracks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply absolute sensor and spatial validation to a placement candidate."""
+
+    matrix = np.asarray(transform, dtype=np.float64)
+    vertices = np.asarray(vertices_local, dtype=np.float64)
+    finite_transform = bool(np.all(np.isfinite(matrix)))
+    world = (
+        vertices @ matrix[:3, :3].T + matrix[:3, 3]
+        if finite_transform
+        else np.full_like(vertices, np.nan)
+    )
+    finite_vertices = bool(len(world) and np.all(np.isfinite(world)))
+    dimensions = np.ptp(world, axis=0) if finite_vertices else np.zeros(3)
+    positive_dimensions = bool(np.all(dimensions > 1e-6))
+    metrics = (
+        evaluate_mesh_views(vertices, np.asarray(faces), matrix, views)
+        if finite_transform and finite_vertices and views
+        else {
+            "views": [],
+            "view_count": 0,
+            "median_depth_residual_m": math.inf,
+            "hit_fraction": 0.0,
+            "false_background_fraction": 1.0,
+            "median_range_m": math.inf,
+        }
+    )
+    residual_limit = max(0.40, 0.02 * float(metrics["median_range_m"]))
+    collisions = (
+        _neighbor_centroid_collisions(track, tracks, world) if finite_vertices else []
+    )
+    checks = {
+        "finite_transform": finite_transform,
+        "finite_vertices": finite_vertices,
+        "positive_dimensions": positive_dimensions,
+        "has_sensor_view": bool(views),
+        "depth_residual": bool(
+            float(metrics["median_depth_residual_m"]) <= residual_limit
+        ),
+        "inside_mask_hits": bool(float(metrics["hit_fraction"]) >= 0.80),
+        "background_clearance": bool(
+            float(metrics["false_background_fraction"]) <= 0.30
+        ),
+        "neighbor_centroids_clear": not collisions,
+    }
+    return {
+        "accepted": all(checks.values()),
+        "checks": checks,
+        "limits": {
+            "median_depth_residual_m": residual_limit,
+            "minimum_hit_fraction": 0.80,
+            "maximum_false_background_fraction": 0.30,
+        },
+        "metrics": metrics,
+        "dimensions_world_m": dimensions.tolist(),
+        "neighbor_centroid_collisions": collisions,
+    }
+
+
+def _observation_points(run_dir: Path, observation: dict[str, Any]) -> np.ndarray:
+    with np.load(artifact_path(run_dir, observation["points_path"])) as point_file:
+        return np.asarray(point_file["points_world"], dtype=np.float64)
+
+
+def _fit_and_validate_candidate(
+    *,
+    mode: str,
+    mesh: Any,
+    baseline_transform: np.ndarray,
+    views: list[LidarFitView],
+    target_points: np.ndarray,
+    config: ReconstructConfig,
+    track: dict[str, Any],
+    tracks: list[dict[str, Any]],
+) -> tuple[str, np.ndarray, dict[str, Any], dict[str, Any]]:
+    if config.fit_mode == "none":
+        transform = baseline_transform
+        fit: dict[str, Any] = {
+            "method": "none",
+            "accepted": False,
+            "reason": "sensor-ray refinement disabled",
+        }
+    else:
+        transform, fit = refine_mesh_with_lidar_rays(
+            np.asarray(mesh.vertices),
+            np.asarray(mesh.faces),
+            baseline_transform,
+            views,
+            target_points,
+            max_axis_scale_change=config.fit_max_axis_scale_change,
+            max_rotation_deg=config.fit_max_rotation_deg,
+            max_evaluations=config.fit_max_evaluations,
+            grounded=config.fit_grounded,
+        )
+    validation = validate_mesh_placement(
+        np.asarray(mesh.vertices),
+        np.asarray(mesh.faces),
+        transform,
+        views,
+        track,
+        tracks,
+    )
+    return mode, transform, fit, validation
 
 
 def reconstruct_route(
@@ -551,101 +800,218 @@ def reconstruct_route(
     failures = 0
     try:
         for track in pending:
-            try:
-                rgb, mask, pointmap, world_from_p3d, context = prepare_sam3d_inputs(
-                    run_dir, manifest, track
-                )
-                track_dir = run_dir / "tracks" / track["id"]
-                crop_path = track_dir / "sam3d_crop.png"
-                crop_mask_path = track_dir / "sam3d_mask.png"
-                Image.fromarray(rgb).save(crop_path, format="PNG")
-                Image.fromarray(mask.astype(np.uint8) * 255).save(
-                    crop_mask_path, format="PNG"
-                )
-                image = image_loader(crop_path)
-                output = inference(
-                    image,
-                    mask,
-                    seed=config.seed,
-                    pointmap=pointmap,
-                    mesh_target_faces=config.mesh_target_faces,
-                    flat_shading=config.flat_shading,
-                    stage1_inference_steps=config.stage1_inference_steps,
-                    stage2_inference_steps=config.stage2_inference_steps,
-                )
-                if output.get("glb") is None:
-                    raise RuntimeError("SAM3D output did not contain a GLB mesh")
-                rotation = _tensor_values(output["rotation"], 4)
-                translation = _tensor_values(output["translation"], 3)
-                scale = _tensor_values(output["scale"], 3)
-                camera_from_glb = model_pose_to_glb_transform(
-                    rotation, translation, scale
-                )
-                initial_world_from_glb = world_from_p3d @ camera_from_glb
-                mesh = _as_trimesh(output["glb"])
-                point_artifact = track.get("reconstruction_points") or track["points"]
-                with np.load(artifact_path(run_dir, point_artifact)) as point_file:
-                    track_points = point_file["points_world"]
-                stabilized_transform, orientation = stabilize_mesh_orientation(
-                    np.asarray(mesh.vertices),
-                    track_points,
-                    initial_world_from_glb,
-                    grounded=config.fit_grounded,
-                    align_long_axis=config.fit_align_long_axis,
-                    max_up_tilt_deg=config.fit_max_up_tilt_deg,
-                )
-                if config.fit_mode == "none":
-                    final_transform = stabilized_transform
-                    fit = {
-                        "method": "none",
-                        "accepted": False,
-                        "reason": "sensor-ray refinement disabled",
-                        "orientation": orientation,
-                    }
-                else:
+            original_selected = track["selected_observation_id"]
+            ranked_ids = list(track.get("ranked_observation_ids") or [])
+            if not ranked_ids:
+                ranked_ids = [track["selected_observation_id"]]
+            attempt_ids = ranked_ids[: config.max_reconstruction_view_attempts]
+            attempts: list[dict[str, Any]] = []
+            reconstructed = False
+            for attempt_index, observation_id in enumerate(attempt_ids, 1):
+                track["selected_observation_id"] = observation_id
+                attempt: dict[str, Any] = {
+                    "attempt": attempt_index,
+                    "observation_id": observation_id,
+                }
+                try:
+                    rgb, mask, pointmap, world_from_p3d, context = prepare_sam3d_inputs(
+                        run_dir, manifest, track
+                    )
+                    track_dir = run_dir / "tracks" / track["id"]
+                    attempt_dir = (
+                        track_dir / "attempts" / f"attempt-{attempt_index:02d}"
+                    )
+                    attempt_dir.mkdir(parents=True, exist_ok=True)
+                    attempt_crop = attempt_dir / "crop.png"
+                    attempt_mask = attempt_dir / "mask.png"
+                    Image.fromarray(rgb).save(attempt_crop, format="PNG")
+                    Image.fromarray(mask.astype(np.uint8) * 255).save(
+                        attempt_mask, format="PNG"
+                    )
+                    attempt["crop"] = relative_artifact(run_dir, attempt_crop)
+                    attempt["mask"] = relative_artifact(run_dir, attempt_mask)
+                    image = image_loader(attempt_crop)
+                    output = inference(
+                        image,
+                        mask,
+                        seed=config.seed,
+                        pointmap=pointmap,
+                        mesh_target_faces=config.mesh_target_faces,
+                        flat_shading=config.flat_shading,
+                        stage1_inference_steps=config.stage1_inference_steps,
+                        stage2_inference_steps=config.stage2_inference_steps,
+                    )
+                    if output.get("glb") is None:
+                        raise RuntimeError("SAM3D output did not contain a GLB mesh")
+                    rotation = _tensor_values(output["rotation"], 4)
+                    translation = _tensor_values(output["translation"], 3)
+                    scale = _tensor_values(output["scale"], 3)
+                    camera_from_glb = model_pose_to_glb_transform(
+                        rotation, translation, scale
+                    )
+                    initial_world_from_glb = world_from_p3d @ camera_from_glb
+                    mesh = _as_trimesh(output["glb"])
+                    observation = _prediction_for_track(track)
+                    observation_points = _observation_points(run_dir, observation)
+                    point_artifact = (
+                        track.get("reconstruction_points") or track["points"]
+                    )
+                    with np.load(artifact_path(run_dir, point_artifact)) as point_file:
+                        track_points = point_file["points_world"]
+                    stabilized_transform, orientation = stabilize_mesh_orientation(
+                        np.asarray(mesh.vertices),
+                        track_points,
+                        initial_world_from_glb,
+                        grounded=config.fit_grounded,
+                        align_long_axis=config.fit_align_long_axis,
+                        max_up_tilt_deg=config.fit_max_up_tilt_deg,
+                    )
+                    anchored_transform, anchoring = align_mesh_to_observation_tangent(
+                        np.asarray(mesh.vertices),
+                        stabilized_transform,
+                        observation_points,
+                        np.asarray(context["view_direction_world"]),
+                    )
                     views = load_lidar_fit_views(
                         run_dir,
                         manifest,
                         track,
                         maximum_rays=config.fit_max_rays_per_view,
                         maximum_views=config.fit_max_views,
+                        preferred_observation_id=observation_id,
                     )
-                    final_transform, fit = refine_mesh_with_lidar_rays(
-                        np.asarray(mesh.vertices),
-                        np.asarray(mesh.faces),
-                        stabilized_transform,
-                        views,
-                        track_points,
-                        max_axis_scale_change=config.fit_max_axis_scale_change,
-                        max_rotation_deg=config.fit_max_rotation_deg,
-                        max_evaluations=config.fit_max_evaluations,
-                        grounded=config.fit_grounded,
+                    selected_views = [
+                        value
+                        for value in views
+                        if value.observation_id == observation_id
+                    ]
+                    placement_candidates: list[
+                        tuple[str, np.ndarray, dict[str, Any], dict[str, Any]]
+                    ] = []
+                    if len(views) >= 2:
+                        placement_candidates.append(
+                            _fit_and_validate_candidate(
+                                mode="multi_view",
+                                mesh=mesh,
+                                baseline_transform=anchored_transform,
+                                views=views,
+                                target_points=track_points,
+                                config=config,
+                                track=track,
+                                tracks=tracks_document["tracks"],
+                            )
+                        )
+                    if (
+                        not placement_candidates
+                        or not placement_candidates[-1][3]["accepted"]
+                    ):
+                        placement_candidates.append(
+                            _fit_and_validate_candidate(
+                                mode="snapshot",
+                                mesh=mesh,
+                                baseline_transform=anchored_transform,
+                                views=selected_views,
+                                target_points=observation_points,
+                                config=config,
+                                track=track,
+                                tracks=tracks_document["tracks"],
+                            )
+                        )
+                    accepted_candidate = next(
+                        (
+                            value
+                            for value in placement_candidates
+                            if value[3]["accepted"]
+                        ),
+                        None,
+                    )
+                    attempt["placement_candidates"] = [
+                        {
+                            "placement_mode": mode,
+                            "fit": candidate_fit,
+                            "validation": validation,
+                        }
+                        for mode, _, candidate_fit, validation in placement_candidates
+                    ]
+                    if accepted_candidate is None:
+                        attempt["placement_validation"] = (
+                            placement_candidates[-1][3]
+                            if placement_candidates
+                            else {"accepted": False, "reason": "no sensor views"}
+                        )
+                        raise RuntimeError("mesh placement failed absolute validation")
+                    placement_mode, final_transform, fit, validation = (
+                        accepted_candidate
                     )
                     fit["orientation"] = orientation
-                mesh_path = run_dir / "meshes" / f"{track['id']}.glb"
-                _export_positioned_glb(mesh, final_transform, mesh_path, track["id"])
-                track["status"] = "ok"
-                track["sam3d_crop"] = relative_artifact(run_dir, crop_path)
-                track["sam3d_mask"] = relative_artifact(run_dir, crop_mask_path)
-                track["mesh"] = {
-                    "path": relative_artifact(run_dir, mesh_path),
-                    "world_from_glb": final_transform.tolist(),
-                    "initial_world_from_glb": initial_world_from_glb.tolist(),
-                    "sam3d_pose": {
-                        "rotation_wxyz": rotation.tolist(),
-                        "translation": translation.tolist(),
-                        "scale": scale.tolist(),
-                        "convention": "PyTorch3D row-vector local-to-camera",
-                    },
-                    "pointmap_world_from_camera": world_from_p3d.tolist(),
-                    "fit": fit,
-                    "source_frame_id": context["frame_id"],
-                }
-            except Exception as exc:
+                    fit["tangent_alignment"] = anchoring
+                    attempt["placement_mode"] = placement_mode
+                    attempt["placement_validation"] = validation
+                    mesh_path = run_dir / "meshes" / f"{track['id']}.glb"
+                    _export_positioned_glb(
+                        mesh, final_transform, mesh_path, track["id"]
+                    )
+                    crop_path = track_dir / "sam3d_crop.png"
+                    crop_mask_path = track_dir / "sam3d_mask.png"
+                    shutil.copy2(attempt_crop, crop_path)
+                    shutil.copy2(attempt_mask, crop_mask_path)
+                    frames = list(manifest["keyframes"]) + list(
+                        manifest.get("recovery_frames", [])
+                    )
+                    source_frame = next(
+                        frame
+                        for frame in frames
+                        if frame["id"] == observation["frame_id"]
+                    )
+                    source_rgb = artifact_path(run_dir, source_frame["rgb"])
+                    best_rgb = artifact_path(run_dir, track["best_rgb"])
+                    source_mask = artifact_path(run_dir, observation["mask_path"])
+                    best_mask = artifact_path(run_dir, track["best_mask"])
+                    if source_rgb != best_rgb:
+                        shutil.copy2(source_rgb, best_rgb)
+                    if source_mask != best_mask:
+                        shutil.copy2(source_mask, best_mask)
+                    track["status"] = "ok"
+                    track["placement_mode"] = placement_mode
+                    track["placement_validation"] = validation
+                    track["sam3d_crop"] = relative_artifact(run_dir, crop_path)
+                    track["sam3d_mask"] = relative_artifact(run_dir, crop_mask_path)
+                    track["mesh"] = {
+                        "path": relative_artifact(run_dir, mesh_path),
+                        "world_from_glb": final_transform.tolist(),
+                        "initial_world_from_glb": initial_world_from_glb.tolist(),
+                        "sam3d_pose": {
+                            "rotation_wxyz": rotation.tolist(),
+                            "translation": translation.tolist(),
+                            "scale": scale.tolist(),
+                            "convention": "PyTorch3D row-vector local-to-camera",
+                        },
+                        "pointmap_world_from_camera": world_from_p3d.tolist(),
+                        "fit": fit,
+                        "placement_mode": placement_mode,
+                        "placement_validation": validation,
+                        "source_frame_id": context["frame_id"],
+                    }
+                    attempt["status"] = "ok"
+                    attempts.append(attempt)
+                    reconstructed = True
+                    break
+                except Exception as exc:
+                    attempt["status"] = "failed"
+                    attempt["error"] = (
+                        f"{type(exc).__name__}: {str(exc).replace(chr(10), ' ')[:500]}"
+                    )
+                    attempts.append(attempt)
+            track["reconstruction_attempts"] = attempts
+            if not reconstructed:
+                track["selected_observation_id"] = original_selected
                 failures += 1
-                track["status"] = "failed"
+                placement_failed = any(
+                    value.get("placement_validation") is not None for value in attempts
+                )
+                track["status"] = "failed_placement" if placement_failed else "failed"
                 track["mesh"] = {
-                    "error": f"{type(exc).__name__}: {str(exc).replace(chr(10), ' ')[:500]}"
+                    "error": attempts[-1]["error"] if attempts else "no eligible views"
                 }
             atomic_write_json(tracks_path, tracks_document)
 
@@ -658,7 +1024,9 @@ def reconstruct_route(
                 }
             )
         )
-        update_stage(manifest, "reconstruct", config.manifest_value(), status="complete")
+        update_stage(
+            manifest, "reconstruct", config.manifest_value(), status="complete"
+        )
         atomic_write_json(tracks_path, tracks_document)
         atomic_write_json(manifest_path, manifest)
     except Exception as exc:
